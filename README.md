@@ -94,7 +94,6 @@ REM cmd
 
 - **Mac 详细**：`docs/USAGE_MAC.md`
 - **Windows 详细**：`docs/WINDOWS.md`
-- **素材说明**（972MB/91个视频不进库）：`docs/测试素材说明.md`
 - **slowroads 可选分支**：`offline_demo/slowroads/README.md` + `docs/slowroads-任务清单.md`
 - **移植全记录**：`docs/IDEA.md` `docs/PLAN.md` `docs/CHANGELOG.md` `docs/跳变-根因与修复计划.md`
 
