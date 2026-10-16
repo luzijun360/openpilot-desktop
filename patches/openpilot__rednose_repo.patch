@@ -1,0 +1,125 @@
+diff --git a/MANIFEST.in b/MANIFEST.in
+deleted file mode 100644
+index a52d827..0000000
+--- a/MANIFEST.in
++++ /dev/null
+@@ -1,3 +0,0 @@
+-include SConstruct
+-graft rednose
+-global-exclude __pycache__ *.pyc *.o *.os *.d
+diff --git a/pyproject.toml b/pyproject.toml
+index 9d660f5..eadb653 100644
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -24,14 +24,14 @@ dev = [
+ ]
+ 
+ [build-system]
+-requires = ["setuptools>=64", "Cython", "scons", "numpy", "comma-deps-eigen"]
++requires = ["setuptools"]
+ build-backend = "setuptools.build_meta"
+ 
+ [tool.setuptools.packages.find]
+ include = ["rednose*"]
+ 
+ [tool.setuptools.package-data]
+-rednose = ["helpers/*.h", "helpers/*.a", "helpers/*.so", "helpers/*.dylib", "helpers/chi2_lookup_table.npy", "templates/*", "site_scons/site_tools/*.py"]
++"*" = ["*.so", "helpers/chi2_lookup_table.npy", "templates/*"]
+ 
+ # https://beta.ruff.rs/docs/configuration/#using-pyprojecttoml
+ [tool.ruff]
+diff --git a/rednose/__init__.py b/rednose/__init__.py
+index dba1dbc..e69de29 100644
+--- a/rednose/__init__.py
++++ b/rednose/__init__.py
+@@ -1,6 +0,0 @@
+-import os
+-
+-
+-INCLUDE_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+-LIB_PATH = os.path.join(os.path.dirname(__file__), "helpers", "libekf_sym.a")
+-SCONS_TOOL_PATH = os.path.join(os.path.dirname(__file__), "site_scons", "site_tools")
+diff --git a/rednose/site_scons/__init__.py b/rednose/site_scons/__init__.py
+deleted file mode 100644
+index e69de29..0000000
+diff --git a/rednose/site_scons/site_tools/__init__.py b/rednose/site_scons/site_tools/__init__.py
+deleted file mode 100644
+index e69de29..0000000
+diff --git a/rednose/site_scons/site_tools/rednose_filter.py b/rednose/site_scons/site_tools/rednose_filter.py
+deleted file mode 100644
+index 081a4e8..0000000
+--- a/rednose/site_scons/site_tools/rednose_filter.py
++++ /dev/null
+@@ -1,46 +0,0 @@
+-import platform
+-
+-import eigen
+-from SCons.Script import Dir, File
+-
+-
+-def compile_single_filter(env, target, filter_gen_script, output_dir, extra_gen_artifacts, script_deps):
+-  generated_src_files = [File(f) for f in [f'{output_dir}/{target}.cpp', f'{output_dir}/{target}.h']]
+-  extra_generated_files = [File(f'{output_dir}/{x}') for x in extra_gen_artifacts]
+-  generator_file = File(filter_gen_script)
+-
+-  env.Command(generated_src_files + extra_generated_files,
+-              [generator_file] + script_deps, f"{File(generator_file).relpath} {target} {Dir(output_dir).relpath}")
+-
+-  return File(generated_src_files[:1])
+-
+-
+-class BaseRednoseCompileMethod:
+-  def __init__(self, base_py_deps, base_cc_deps):
+-    self.base_py_deps = base_py_deps
+-    self.base_cc_deps = base_cc_deps
+-
+-
+-class CompileFilterMethod(BaseRednoseCompileMethod):
+-  def __call__(self, env, target, filter_gen_script, output_dir, extra_gen_artifacts=[], gen_script_deps=[]):
+-    env = env.Clone()
+-    env.Append(CPPPATH=[eigen.INCLUDE_DIR])
+-
+-    objects = compile_single_filter(env, target, filter_gen_script, output_dir, extra_gen_artifacts, self.base_py_deps + gen_script_deps)
+-    linker_flags = env.get("LINKFLAGS", [])
+-    if platform.system() == "Darwin":
+-      linker_flags = ["-undefined", "dynamic_lookup"]
+-    return env.SharedLibrary(f'{output_dir}/{target}', [self.base_cc_deps, objects], LINKFLAGS=linker_flags)
+-
+-
+-def generate(env):
+-  templates = env.Glob("$REDNOSE_ROOT/rednose/templates/*")
+-  sympy_helpers = env.File("$REDNOSE_ROOT/rednose/helpers/sympy_helpers.py")
+-  ekf_sym = env.File("$REDNOSE_ROOT/rednose/helpers/ekf_sym.py")
+-
+-  gen_script_deps = templates + [sympy_helpers, ekf_sym]
+-  env.AddMethod(CompileFilterMethod(gen_script_deps, []), "RednoseCompileFilter")
+-
+-
+-def exists(env):
+-  return True
+diff --git a/setup.py b/setup.py
+deleted file mode 100644
+index e3f6d01..0000000
+--- a/setup.py
++++ /dev/null
+@@ -1,20 +0,0 @@
+-import os
+-import subprocess
+-
+-from setuptools import Distribution, setup
+-from setuptools.command.build_py import build_py
+-
+-
+-class BinaryDistribution(Distribution):
+-  def has_ext_modules(self):
+-    return True
+-
+-
+-class BuildPyWithScons(build_py):
+-  def run(self):
+-    root = os.path.dirname(os.path.abspath(__file__))
+-    subprocess.check_call(["scons", f"-j{os.cpu_count() or 1}", "rednose"], cwd=root)
+-    super().run()
+-
+-
+-setup(cmdclass={"build_py": BuildPyWithScons}, distclass=BinaryDistribution)

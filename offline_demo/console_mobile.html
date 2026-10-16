@@ -1,0 +1,1029 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover,maximum-scale=1">
+<meta name="theme-color" content="#0b0e13">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>openpilot 控制台</title>
+<style>
+  :root{
+    --bg:#0b0e13; --panel:#11161e; --panel2:#0e131a; --line:#1f2733;
+    --fg:#e6edf3; --dim:#8b98a8; --green:#3ee06e; --red:#e5484d; --yellow:#daca25;
+    --safe-b:env(safe-area-inset-bottom,0px);
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;background:var(--bg);color:var(--fg);
+    font:14px/1.45 -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",sans-serif;
+    overscroll-behavior:none}
+  /* ============ 手机端骨架：固定头 + 常驻画面 + 可切面板 + 底部标签栏 ============ */
+  body{display:flex;flex-direction:column;height:100vh;height:100dvh;overflow:hidden}
+  #topbar{flex:0 0 auto;display:flex;align-items:center;gap:8px;padding:calc(6px + env(safe-area-inset-top,0px)) 12px 6px;
+    background:var(--panel2);border-bottom:1px solid var(--line);font-size:13px;z-index:30}
+  #topbar b{font-size:14px;font-weight:600}
+  #topInfo{color:var(--dim);font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #conn{margin-left:auto;flex:0 0 auto;font-size:11px;padding:3px 9px;border-radius:20px;
+    background:#1a2230;border:1px solid #2a3444;color:var(--dim);white-space:nowrap}
+  #conn.on{color:#b6f7cd;border-color:#256b41;background:#173a25}
+  #conn.bad{color:#ffc9cb;border-color:#6b2529;background:#3a1a1d}
+
+  .dot{width:8px;height:8px;border-radius:50%;background:#39424f;display:inline-block;flex:0 0 auto}
+  .dot.on{background:var(--green);box-shadow:0 0 6px var(--green)}
+  .dot.bad{background:var(--red);box-shadow:0 0 6px var(--red)}
+  .dot.warn{background:var(--yellow);box-shadow:0 0 6px var(--yellow)}
+
+  #pView{flex:0 0 auto;background:var(--panel);border-bottom:1px solid var(--line);z-index:20}
+  #viewWrap{position:relative;background:#000;display:flex;justify-content:center;align-items:center;overflow:hidden}
+  /* 关键：img 用 width/height auto + max 限制 → 元素框 = 画面框（无 letterbox），
+     这样触控坐标换算 getBoundingClientRect() 就是精确的，不会偏 */
+  #opScreen{display:block;width:auto;height:auto;max-width:100%;max-height:44dvh;
+    object-fit:fill;-webkit-user-drag:none;user-select:none;touch-action:manipulation;cursor:pointer}
+  #starting{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    gap:6px;background:rgba(8,11,16,.92);color:#cfe3ff;font-size:14px;text-align:center;transition:opacity .35s;pointer-events:none}
+  #starting .sub{font-size:11.5px;color:var(--dim)}
+  #starting.hide{opacity:0}
+  #alert{position:absolute;left:0;right:0;bottom:0;padding:6px 14px;font-size:12.5px;color:#ffd7d7;
+    background:linear-gradient(transparent,rgba(120,20,20,.85));opacity:0;transition:.2s;pointer-events:none}
+  #alert.show{opacity:1}
+  .ripple{position:absolute;width:30px;height:30px;margin:-15px 0 0 -15px;border-radius:50%;
+    border:2px solid rgba(120,200,255,.95);background:rgba(120,200,255,.22);pointer-events:none;
+    animation:rip .55s ease-out forwards}
+  @keyframes rip{from{transform:scale(.35);opacity:1}to{transform:scale(1.7);opacity:0}}
+
+  #panels{flex:1 1 auto;min-height:0;position:relative}
+  .panel{background:var(--panel);border-top:1px solid var(--line);display:none;
+    position:absolute;inset:0;overflow:auto;-webkit-overflow-scrolling:touch}
+  .panel.active{display:block}
+  .phead{display:flex;align-items:center;gap:8px;padding:8px 12px;border-bottom:1px solid var(--line);
+    background:var(--panel2);font-size:12px;color:var(--dim);position:sticky;top:0;z-index:5}
+  .phead b{color:var(--fg);font-size:13px;font-weight:600}
+  .phead .right{margin-left:auto;font-size:11px}
+
+  #tabbar{flex:0 0 auto;display:grid;grid-template-columns:repeat(4,1fr);
+    background:var(--panel2);border-top:1px solid var(--line);
+    padding-bottom:var(--safe-b);z-index:30}
+  #tabbar button{background:none;border:0;color:var(--dim);font-size:11.5px;padding:9px 2px 8px;
+    font-family:inherit;display:flex;flex-direction:column;align-items:center;gap:3px;position:relative}
+  #tabbar button i{font-style:normal;font-size:19px;line-height:1}
+  #tabbar button.sel{color:#cfe3ff}
+  #tabbar button.sel::before{content:'';position:absolute;top:0;left:22%;right:22%;height:2px;
+    background:#3b82f6;border-radius:2px}
+  #tabbar button .badge{position:absolute;top:4px;right:calc(50% - 22px);width:7px;height:7px;border-radius:50%;background:var(--red)}
+
+  /* ============ 通用控件 ============ */
+  .row{padding:11px 12px}
+  .row+.row{border-top:1px solid var(--line)}
+  .lbl{font-size:11px;color:var(--dim);margin-bottom:8px;letter-spacing:.5px}
+  button{background:#1a2230;color:var(--fg);border:1px solid #2a3444;border-radius:10px;
+    padding:12px 12px;font-size:14px;cursor:pointer;font-family:inherit;transition:.12s;
+    min-height:46px;display:inline-flex;align-items:center;justify-content:center;gap:6px}
+  button:active{transform:translateY(1px);background:#222d3d}
+  button.primary{background:#173a25;border-color:#256b41;color:#b6f7cd}
+  button.danger{background:#3a1a1d;border-color:#6b2529;color:#ffc9cb}
+  button.on{background:#173a25;border-color:#256b41;color:#b6f7cd}
+  button.ghost{background:#141b25;border-color:#232c39;color:var(--dim)}
+  button:disabled{opacity:.45}
+  select{background:#0e131a;color:var(--fg);border:1px solid #2a3444;border-radius:10px;
+    padding:12px 10px;font-size:14px;font-family:inherit;width:100%;min-height:46px;-webkit-appearance:none;
+    background-image:linear-gradient(45deg,transparent 50%,#8b98a8 50%),linear-gradient(135deg,#8b98a8 50%,transparent 50%);
+    background-position:calc(100% - 18px) 21px,calc(100% - 13px) 21px;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .grid3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+  .stack{display:flex;flex-direction:column;gap:8px}
+  .hint{font-size:11.5px;color:var(--dim);margin-top:8px;line-height:1.55}
+  .hint b{color:#cfe3ff}
+  .kv{display:flex;justify-content:space-between;gap:10px;padding:7px 12px;font-size:13px;
+    border-bottom:1px dashed #1a212b}
+  .kv:last-child{border-bottom:0}
+  .kv span:first-child{color:var(--dim);flex:0 0 auto}
+  .kv b{font-variant-numeric:tabular-nums;font-weight:600;text-align:right;min-width:0}
+  .ok{color:var(--green)} .warn{color:var(--yellow)} .badc{color:var(--red)} .dimc{color:var(--dim)}
+  .seg{display:grid;grid-auto-flow:column;gap:6px;background:#0e131a;border:1px solid #2a3444;
+    border-radius:10px;padding:4px}
+  .seg button{min-height:38px;padding:7px 4px;font-size:13px;background:none;border:0;border-radius:7px;color:var(--dim)}
+  .seg button.sel{background:#243044;color:#cfe3ff}
+
+  /* 日志 */
+  .tabs{display:flex;gap:6px;padding:8px 10px 0;overflow-x:auto}
+  .tabs button{padding:8px 13px;font-size:12.5px;min-height:38px;flex:0 0 auto}
+  .tabs button.sel{background:#243044;border-color:#3a4a63;color:#cfe3ff}
+  #logbox{padding:10px 12px;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;
+    color:#9fb0c2;word-break:break-all}
+
+  /* 方向盘 / 踏板 */
+  #driveW{display:flex;align-items:center;justify-content:center;gap:16px;padding:14px 12px}
+  #wheelBox{position:relative;width:126px;height:146px;flex:0 0 auto}
+  #wheelScale,#wheelSvg{position:absolute;left:5px;top:0;width:116px;height:116px}
+  #wheelSvg{transition:transform .09s linear}
+  #wheelDeg{position:absolute;left:0;right:0;bottom:0;text-align:center;
+    font:700 14px ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.5px}
+  #wheelDeg.c0{color:#7d8b9c} #wheelDeg.cL{color:#4ea1ff} #wheelDeg.cR{color:#ffa94d}
+  .pedals{display:flex;gap:14px;flex:0 0 auto}
+  .pedal{display:flex;flex-direction:column;align-items:center;gap:5px}
+  .pbar{position:relative;width:40px;height:104px;background:#0e131a;border:1px solid var(--line);
+    border-radius:8px;overflow:hidden}
+  .pfill{position:absolute;left:0;right:0;bottom:0;height:0%;transition:height .1s linear}
+  #brakeFill{background:linear-gradient(180deg,#e5484d,#7a2124)}
+  #gasFill{background:linear-gradient(180deg,#3ee06e,#1d6e39)}
+  .ptxt{position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);text-align:center;
+    font-size:12px;font-weight:700;color:#fff;text-shadow:0 1px 3px rgba(0,0,0,.9);font-variant-numeric:tabular-nums}
+  .plbl{font-size:11.5px;color:var(--dim)}
+
+  /* 指示器 */
+  #indBody{display:flex;align-items:center;gap:12px;padding:12px}
+  #indSvg{width:150px;height:121px;flex:0 0 auto}
+  #leadCar.aeb rect{fill:#ff453a}
+  #leadCar.aeb{animation:aebBlink .55s linear infinite}
+  @keyframes aebBlink{0%,44%{opacity:1}50%,94%{opacity:.18}100%{opacity:1}}
+  #indLead .aebtxt{color:#ff453a;font-weight:700}
+  @media (prefers-reduced-motion:reduce){#leadCar.aeb{animation:none}}
+  #indRows{flex:1 1 auto;min-width:0}
+  .indkv{display:flex;justify-content:space-between;gap:8px;font-size:12.5px;padding:6px 0;
+    border-bottom:1px dashed #1a212b;color:var(--dim)}
+  .indkv:last-child{border-bottom:0}
+  .indkv b{color:var(--fg);font-weight:600;font-variant-numeric:tabular-nums;text-align:right}
+
+  /* ============ 导入弹窗 ============ */
+  .sheet{position:fixed;inset:0;background:rgba(4,7,11,.72);display:none;z-index:60;
+    align-items:flex-end;justify-content:center}
+  .sheet.show{display:flex}
+  .sheetCard{width:100%;max-width:560px;max-height:88dvh;overflow:auto;background:var(--panel);
+    border:1px solid var(--line);border-radius:18px 18px 0 0;padding:16px 14px calc(16px + var(--safe-b));
+    animation:up .22s ease-out}
+  @keyframes up{from{transform:translateY(24px);opacity:.6}to{transform:none;opacity:1}}
+  .sheetCard h3{margin:2px 0 14px;font-size:16px}
+  .crumb{display:flex;gap:6px;align-items:center;font-size:11.5px;color:var(--dim);
+    background:#0e131a;border:1px solid var(--line);border-radius:10px;padding:9px 10px;margin:12px 0 8px;
+    word-break:break-all;line-height:1.5}
+  .crumb b{color:#cfe3ff;font-weight:600}
+  .fslist{border:1px solid var(--line);border-radius:12px;overflow:hidden;max-height:42dvh;overflow-y:auto}
+  /* 快捷入口：横向滚动的紧凑胶囊，别占满屏 */
+  #fsRoots{display:flex;gap:6px;overflow-x:auto;margin-bottom:8px;padding-bottom:2px;-webkit-overflow-scrolling:touch}
+  #fsRoots::-webkit-scrollbar{display:none}
+  .fsitem{display:flex;align-items:center;gap:10px;padding:12px 12px;border-bottom:1px solid #171e28;
+    font-size:13.5px;min-height:48px}
+  .fsitem:last-child{border-bottom:0}
+  .fsitem:active{background:#1a2230}
+  .fsitem .ic{flex:0 0 auto;font-size:17px}
+  .fsitem .nm{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .fsitem .sz{flex:0 0 auto;font-size:11px;color:var(--dim);font-variant-numeric:tabular-nums}
+  .fsitem.video .nm{color:#cfe3ff}
+  .fsempty{padding:22px;text-align:center;color:var(--dim);font-size:12.5px}
+  .bar{height:8px;border-radius:6px;background:#0e131a;border:1px solid var(--line);overflow:hidden;margin-top:8px}
+  .bar i{display:block;height:100%;width:0%;background:linear-gradient(90deg,#2563eb,#3ee06e);transition:width .18s}
+  .toast{position:fixed;left:50%;bottom:calc(76px + var(--safe-b));transform:translateX(-50%);
+    background:#16202c;border:1px solid #2a3444;color:var(--fg);padding:11px 18px;border-radius:12px;
+    font-size:13.5px;opacity:0;transition:.25s;pointer-events:none;z-index:99;max-width:88vw;text-align:center}
+  .toast.show{opacity:1}
+
+  /* ============ iPad / 宽屏：全部面板铺开，取消标签栏 ============ */
+  @media (min-width:820px){
+    body{display:block;height:auto;min-height:100dvh;overflow:auto;padding:10px}
+    #topbar{position:sticky;top:0;border-radius:12px;border:1px solid var(--line);margin-bottom:10px;
+      padding:9px 14px}
+    #pView{border:1px solid var(--line);border-radius:14px;overflow:hidden;margin-bottom:10px}
+    #opScreen{max-height:none;width:100%}
+    #panels{position:static;display:grid;gap:10px;grid-template-columns:minmax(0,1.06fr) minmax(0,1fr)}
+    .panel{position:static;display:flex !important;flex-direction:column;inset:auto;overflow:visible;
+      border:1px solid var(--line);border-radius:14px}
+    .panel .phead{border-radius:14px 14px 0 0}
+    #pInd{grid-column:1;grid-row:1}
+    #pStat{grid-column:1;grid-row:2}
+    #pCtrl{grid-column:2;grid-row:1 / span 2}
+    #pLog{grid-column:1 / -1;grid-row:3}
+    #pLog #logbox{max-height:340px;overflow:auto}
+    #tabbar{display:none}
+    .sheet{align-items:center}
+    .sheetCard{border-radius:18px;max-height:82dvh}
+    .kv{font-size:13.5px;padding:8px 14px}
+    .indkv{font-size:13px}
+    #indSvg{width:176px;height:142px}
+  }
+  @media (min-width:1400px){
+    #panels{grid-template-columns:minmax(0,1fr) minmax(0,.86fr) minmax(0,1.04fr)}
+    #pInd{grid-column:1;grid-row:1}
+    #pStat{grid-column:1;grid-row:2}
+    #pCtrl{grid-column:2;grid-row:1 / span 2}
+    #pLog{grid-column:3;grid-row:1 / span 2}
+    #pLog #logbox{max-height:none}
+  }
+</style>
+</head>
+<body>
+
+<header id="topbar">
+  <span class="dot" id="dotStack"></span>
+  <b>openpilot</b>
+  <span id="topInfo">连接中…</span>
+  <span id="conn">连接中…</span>
+</header>
+
+<!-- ===== 常驻：op 原版主机画面（点击可操作） ===== -->
+<section id="pView">
+  <div class="phead">
+    <span class="dot" id="dotCam"></span><b id="opTitle">openpilot 主机画面</b>
+    <span class="dimc right" id="camInfo"></span>
+  </div>
+  <div id="viewWrap">
+    <img id="opScreen" alt="openpilot 主机画面" draggable="false">
+    <div id="starting"><div>openpilot 正在启动…</div>
+      <div class="sub">首次启动约 40 秒（加载模型 + 初始化）<br>画面出现车道线后本提示自动消失</div></div>
+    <div id="alert"></div>
+  </div>
+  <div class="row" style="padding:9px 12px">
+    <div class="lbl" style="display:flex;align-items:center;gap:8px;margin-bottom:7px">
+      <span>画面流（手机省流 · 只影响本机观看，不改变 op）</span>
+      <button class="ghost" id="btnFoldView"
+        style="margin-left:auto;min-height:30px;padding:4px 10px;font-size:11.5px;flex:0 0 auto">▲ 收起画面</button>
+    </div>
+    <div class="seg" id="segQual">
+      <button data-q="low">省流</button>
+      <button data-q="std" class="sel">标准</button>
+      <button data-q="high">高清</button>
+      <button data-q="raw">原画</button>
+    </div>
+    <div class="hint" id="streamInfo">—</div>
+  </div>
+</section>
+
+<div id="panels">
+
+  <!-- ===== 驾驶指示器 ===== -->
+  <section class="panel active" id="pInd" data-panel="ind">
+    <div class="phead"><span class="dot" id="dotInd"></span><b>驾驶指示器</b>
+      <span class="dimc right" id="indMode">-</span></div>
+    <div id="indBody">
+      <svg id="indSvg" viewBox="0 0 260 210" aria-label="驾驶指示器">
+        <polygon id="laneLShape" points="100,26 91,26 28,196 40,196" fill="none" stroke="#3a4656" stroke-width="1.6" stroke-dasharray="5 4"/>
+        <polygon id="laneRShape" points="160,26 169,26 232,196 220,196" fill="none" stroke="#3a4656" stroke-width="1.6" stroke-dasharray="5 4"/>
+        <g id="leadCar" style="display:none">
+          <rect x="110" y="26" width="40" height="27" rx="7" fill="#c9d7e9"/>
+          <rect x="117" y="30" width="26" height="9" rx="3" fill="#243044"/>
+          <rect x="112" y="43" width="7" height="4" rx="2" fill="#e5484d"/>
+          <rect x="141" y="43" width="7" height="4" rx="2" fill="#e5484d"/>
+          <rect x="112" y="50" width="7" height="5" rx="2" fill="#5a6b80"/>
+          <rect x="141" y="50" width="7" height="5" rx="2" fill="#5a6b80"/>
+        </g>
+        <rect id="bar3" x="92" y="112" width="76" height="10" rx="5" fill="#1a2230" stroke="#2a3444" stroke-width="1"/>
+        <rect id="bar2" x="86" y="134" width="88" height="10" rx="5" fill="#1a2230" stroke="#2a3444" stroke-width="1"/>
+        <rect id="bar1" x="80" y="156" width="100" height="10" rx="5" fill="#1a2230" stroke="#2a3444" stroke-width="1"/>
+      </svg>
+      <div id="indRows">
+        <div class="indkv"><span>前车</span><b id="indLead">-</b></div>
+        <div class="indkv"><span>左车道线</span><b id="indL">-</b></div>
+        <div class="indkv"><span>右车道线</span><b id="indR">-</b></div>
+        <div class="indkv"><span>驾驶模式</span><b id="indModeBars">-</b></div>
+      </div>
+    </div>
+    <div id="driveW">
+      <div id="wheelBox">
+        <svg id="wheelScale" viewBox="0 0 120 120" aria-hidden="true"><g id="scaleTicks"></g>
+          <path id="scaleArc" fill="none" stroke="#4ea1ff" stroke-width="3" stroke-linecap="round" opacity="0"/></svg>
+        <svg id="wheelSvg" viewBox="0 0 120 120">
+          <defs>
+            <radialGradient id="rimG" cx="38%" cy="28%" r="82%">
+              <stop offset="0%" stop-color="#66788e"/><stop offset="55%" stop-color="#384555"/>
+              <stop offset="100%" stop-color="#1a222c"/></radialGradient>
+            <linearGradient id="hubG" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0%" stop-color="#4a5663"/><stop offset="100%" stop-color="#232b35"/></linearGradient>
+          </defs>
+          <circle cx="60" cy="60" r="44" fill="none" stroke="#0e141b" stroke-width="14"/>
+          <circle cx="60" cy="60" r="44" fill="none" stroke="url(#rimG)" stroke-width="11.5"/>
+          <rect x="54.5" y="13.5" width="11" height="7.5" rx="3.2" fill="#e5484d"/>
+          <g fill="url(#hubG)" stroke="#0e141b" stroke-width="1.2">
+            <rect x="14" y="55.5" width="38" height="9" rx="4.5"/>
+            <rect x="68" y="55.5" width="38" height="9" rx="4.5"/>
+            <rect x="55.5" y="68" width="9" height="34" rx="4.5"/>
+          </g>
+          <ellipse cx="60" cy="60" rx="23" ry="18" fill="url(#hubG)" stroke="#0d1218" stroke-width="1.5"/>
+          <ellipse cx="60" cy="56" rx="16.5" ry="10.5" fill="#2c3540" opacity=".9"/>
+        </svg>
+        <div id="wheelDeg">-</div>
+      </div>
+      <div class="pedals">
+        <div class="pedal"><div class="pbar"><div class="pfill" id="brakeFill"></div><span class="ptxt" id="brakeTxt">0%</span></div>
+          <div class="plbl">刹车</div></div>
+        <div class="pedal"><div class="pbar"><div class="pfill" id="gasFill"></div><span class="ptxt" id="gasTxt">0%</span></div>
+          <div class="plbl">油门</div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 状态 / 指标 ===== -->
+  <section class="panel" id="pStat" data-panel="stat">
+    <div class="phead"><span class="dot" id="dotData"></span><b>状态 / 指标</b>
+      <span class="dimc right" id="updT"></span></div>
+    <div>
+      <div class="kv"><span>车速</span><b id="sVego">-</b></div>
+      <div class="kv"><span>指令加速度</span><b id="sAccel">-</b></div>
+      <div class="kv"><span>方向盘角度</span><b id="sSteer">-</b></div>
+      <div class="kv"><span>接管状态</span><b id="sEngage">-</b></div>
+      <div class="kv"><span>车型</span><b id="sCar">-</b></div>
+      <div class="kv"><span>车道线置信度</span><b id="sLanes">-</b></div>
+      <div class="kv"><span>车道内偏移</span><b id="sLaneOff">-</b></div>
+      <div class="kv"><span>纵向控制</span><b id="sLong">-</b></div>
+      <div class="kv"><span>前车距离（模型估算）</span><b id="sLeadD">-</b></div>
+      <div class="kv"><span>前车相对速度</span><b id="sLeadV">-</b></div>
+      <div class="kv"><span>模型前车概率</span><b id="sLeadP">-</b></div>
+      <div class="kv"><span>巡航设定</span><b id="sCruise">-</b></div>
+      <div class="kv"><span>模型 / 相机</span><b id="sHz">-</b></div>
+      <div class="kv"><span>接管</span><b id="rEng">-</b></div>
+      <div class="kv"><span>推理引擎（当前）</span><b id="rBackend">-</b></div>
+      <div class="kv"><span>模型频率</span><b id="rMhz">-</b></div>
+      <div class="kv"><span>相机频率</span><b id="rChz">-</b></div>
+      <div class="kv"><span>帧号</span><b id="rFrame">-</b></div>
+      <div class="kv"><span>系统负载</span><b id="rLoad">-</b></div>
+      <div class="kv"><span>内存</span><b id="rMem">-</b></div>
+    </div>
+  </section>
+
+  <!-- ===== 控制台 ===== -->
+  <section class="panel" id="pCtrl" data-panel="ctrl">
+    <div class="phead"><span class="dot" id="dotStack2"></span><b>控制台</b>
+      <span class="dimc right" id="stackInfo"></span></div>
+    <div>
+      <div class="row">
+        <div class="lbl">视频</div>
+        <div class="grid2">
+          <button class="primary" id="btnImport">📁 导入视频…</button>
+          <button class="danger" id="btnStop">⏹ 停止</button>
+        </div>
+        <!-- [恢复到主页 2026-09-30] 一键：切出当前推理 → 退回 op 主页 -->
+        <button id="btnHome" style="width:100%;margin-top:8px">🏠 恢复到主页</button>
+      </div>
+      <div class="row">
+        <div class="lbl">播放控制</div>
+        <div class="grid2">
+          <button id="btnPause">⏸ 暂停</button>
+          <button id="btnSpeed">⏩ 1.0x</button>
+        </div>
+        <div class="grid2" style="margin-top:8px">
+          <button id="btnRestart">⏮ 重播</button>
+          <button class="danger" id="btnQuit">⏻ 退出全部</button>
+        </div>
+        <div class="hint">暂停/倍速/重播直接作用于播放管线（不重启全栈）；「退出全部」= 停 op + 关闭控制台。</div>
+      </div>
+      <div class="row">
+        <div class="lbl">相机标定</div>
+        <div class="grid2">
+          <button id="btnRecalib">🎯 重新校准</button>
+          <button id="btnRestoreCalib">↩ 恢复预置标定</button>
+        </div>
+        <div class="hint" id="calibInfo">标定：—</div>
+        <div class="hint">「重新校准」= 清掉预置的假标定，让 op 从零开始真校准：op 只在 <b>&gt;24km/h、直线、低偏航</b> 时才采校准块（放 30km/h 以上的素材才收敛）。</div>
+      </div>
+      <div class="row">
+        <div class="lbl">测试素材（4 组 × 8 速度档）</div>
+        <div class="stack">
+          <select id="selGroup"></select>
+          <select id="selFile"></select>
+          <button class="primary" id="btnPlaySel">▶ 播放此素材</button>
+        </div>
+      </div>
+      <div class="row">
+        <div class="lbl">导出（同时存到 Mac 桌面 + 下载到本机）</div>
+        <div class="grid2">
+          <button id="btnShot">🖼 保存主机画面</button>
+          <button id="btnData">📊 模型数据</button>
+        </div>
+      </div>
+      <div class="row">
+        <div class="lbl">纵向控制（ACC 接管）</div>
+        <button id="btnLong" style="width:100%">● 未接管</button>
+        <div class="hint">开启后：模拟按巡航键接管，车速跟随模型的加减速指令；关闭会发 CANCEL 解除。</div>
+      </div>
+      <div class="row">
+        <div class="lbl">性能提示（延迟报警）</div>
+        <button id="btnPerf" style="width:100%">○ 已关闭</button>
+        <div class="hint">op 的「TAKE CONTROL / System Lagging」报警——离线 demo 里没有真车，它是误报。开启后会显示提示并发出警报声。</div>
+      </div>
+      <div class="row">
+        <div class="lbl">推理引擎（模型跑在哪）</div>
+        <div class="grid2">
+          <button id="btnAne">🧠 ANE 神经引擎</button>
+          <button id="btnMetal">⚙ Metal（tinygrad）</button>
+        </div>
+        <div class="hint">ANE = Apple 神经引擎，modeld 占用约 <b>15.7%</b>、推理 4.4ms；Metal = tinygrad 路径，约 <b>38%</b>、13.6ms。切换会<b>自动重启演示</b>（约 40 秒）后生效。</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 日志 ===== -->
+  <section class="panel" id="pLog" data-panel="log">
+    <div class="phead"><b>日志</b><span class="dimc right" id="logInfo"></span></div>
+    <div class="tabs">
+      <button class="sel" data-log="stack">运行</button>
+      <button data-log="manager">管理器</button>
+      <button data-log="bridge">假车</button>
+      <button data-log="launcher">启动器</button>
+    </div>
+    <div id="logbox">加载中…</div>
+  </section>
+
+</div>
+
+<nav id="tabbar">
+  <button data-tab="ind" class="sel"><i>🧭</i>指示器</button>
+  <button data-tab="stat"><i>📊</i>指标</button>
+  <button data-tab="ctrl"><i>🎛</i>控制</button>
+  <button data-tab="log"><i>📜</i>日志</button>
+</nav>
+
+<!-- ===== 导入弹窗：① 浏览 Mac 目录 ② 手机上传 ===== -->
+<div class="sheet" id="sheet">
+  <div class="sheetCard">
+    <h3>导入视频</h3>
+    <div class="grid2">
+      <button class="primary" id="btnBrowseMac">💻 浏览 Mac 文件</button>
+      <button id="btnUploadPhone">📱 手机上传</button>
+    </div>
+
+    <div id="fsPane" hidden>
+      <div class="crumb" id="fsCrumb">—</div>
+      <div id="fsRoots"></div>
+      <div class="fslist" id="fsList"><div class="fsempty">加载中…</div></div>
+    </div>
+
+    <div id="upPane" hidden>
+      <div class="hint" id="upHint">选择手机里的视频文件。上传期间请保持屏幕常亮（息屏会中断上传）。</div>
+      <input type="file" id="fileInput" accept="video/*" hidden>
+      <button class="primary" id="btnPickPhone" style="width:100%;margin-top:10px">选择手机文件…</button>
+      <div id="upProg" hidden>
+        <div class="bar"><i id="upBar"></i></div>
+        <div class="hint" id="upTxt">—</div>
+      </div>
+    </div>
+
+    <button class="ghost" id="btnCloseSheet" style="width:100%;margin-top:14px">取消</button>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+/* =========================================================================
+   手机 / iPad 版控制台（2026-09-29）
+   - 接口与桌面版完全一致（16 个），只是画面流换成 JPEG 轮询、导出改下载
+   - 所有 URL 基于 BASE 动态计算 → 挂在 /op 前缀下也能正确工作
+   ========================================================================= */
+const BASE = (() => {
+  let p = location.pathname;
+  if (/\/m\/?$/.test(p)) p = p.replace(/\/m\/?$/, '/');
+  if (!p.endsWith('/')) p += '/';
+  return p;                       // 例：/op/ 或 /
+})();
+const API = BASE + 'api/';
+const $ = s => document.querySelector(s);
+const f1 = x => (isFinite(x) ? x.toFixed(1) : '-');
+const pct = x => (x === null || x === undefined || !isFinite(x)) ? '-' : (x * 100).toFixed(0) + '%';
+const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const fmtSize = b => b >= 1073741824 ? (b/1073741824).toFixed(2)+' GB'
+                 : b >= 1048576 ? (b/1048576).toFixed(1)+' MB' : (b/1024).toFixed(0)+' KB';
+
+let last = {snap:null, ts:0, logName:'stack', tab:'ind', view:'', stream:''};
+const MODE_CN = {aggressive:'Aggressive 激进', standard:'Standard 标准', relaxed:'Relaxed 放松'};
+
+function toast(msg, ms = 2600){
+  const t = $('#toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(t._h); t._h = setTimeout(() => t.classList.remove('show'), ms);
+}
+async function post(path, body){
+  const r = await fetch(BASE + path, {method:'POST', headers:{'Content-Type':'application/json'},
+                                      body: JSON.stringify(body || {})});
+  return r.json();
+}
+
+/* ---------------- 画面流：JPEG 轮询（手机友好，可调画质/帧率） ---------------- */
+const QUAL = {
+  low:  {w:640,  q:45, fps:5,  name:'省流'},
+  std:  {w:960,  q:60, fps:10, name:'标准'},
+  high: {w:1280, q:75, fps:15, name:'高清'},
+  raw:  {w:0,    q:85, fps:20, name:'原画'}
+};
+let qual = 'std', pumpTimer = null, pumpOn = true, stat = {n:0, bytes:0, t0:0, fps:0, kbs:0};
+
+function pumpOnce(){
+  const q = QUAL[qual];
+  const img = new Image();
+  const t0 = performance.now();
+  img.onload = () => {
+    if (!pumpOn) return;
+    const el = $('#opScreen');
+    el.src = img.src;
+    const dt = performance.now() - t0;
+    stat.n++;
+    // 用 resource timing 取真实字节数
+    const rt = performance.getEntriesByName(img.src, 'resource').pop();
+    if (rt) stat.bytes += rt.transferSize || rt.encodedBodySize || 0;
+    if (!stat.t0) stat.t0 = performance.now();
+    const el2 = performance.now() - stat.t0;
+    if (el2 > 1500){ stat.fps = stat.n / (el2 / 1000); stat.kbs = (stat.bytes / 1024) / (el2 / 1000);
+      stat.n = 0; stat.bytes = 0; stat.t0 = performance.now(); }
+    const avgKb = (stat.kbs && stat.fps) ? (stat.kbs / Math.max(stat.fps, 0.1)) : 0;
+    $('#streamInfo').textContent = `${q.name} · ${q.w ? q.w + 'px 宽' : '原始尺寸'} · 质量 ${q.q} · 目标 ${q.fps}fps`
+      + (stat.fps ? `　实测 ${stat.fps.toFixed(1)}fps` : '')
+      + (avgKb > 0 ? ` / 均 ${avgKb.toFixed(0)}KB/帧 · ${stat.kbs.toFixed(0)}KB/s` : '');
+    schedule(Math.max(0, 1000 / q.fps - dt));
+  };
+  img.onerror = () => { if (pumpOn) schedule(1200); };
+  const srcName = (last.view === 'sr') ? 'gameframe.jpg' : 'frame.jpg';   // [slowroads App 自动接入 2026-09-30] 按当前画面源取帧
+  img.src = API + srcName + '?w=' + q.w + '&q=' + q.q + '&t=' + Date.now();
+}
+function schedule(ms){ clearTimeout(pumpTimer); pumpTimer = setTimeout(pumpOnce, ms); }
+function setQual(k){
+  qual = k;
+  document.querySelectorAll('#segQual button').forEach(b => b.classList.toggle('sel', b.dataset.q === k));
+  stat = {n:0, bytes:0, t0:0, fps:0, kbs:0};
+  schedule(0);
+}
+document.querySelectorAll('#segQual button').forEach(b => b.onclick = () => setQual(b.dataset.q));
+
+/* 收起画面：手机上把纵向空间让给下面板 */
+let viewFolded = false;
+$('#btnFoldView').onclick = () => {
+  viewFolded = !viewFolded;
+  $('#viewWrap').style.display = viewFolded ? 'none' : 'flex';
+  $('#btnFoldView').textContent = viewFolded ? '▼ 展开画面' : '▲ 收起画面';
+};
+
+/* ---------------- 主面板更新（逻辑对齐桌面版 console.html） ---------------- */
+function update(snap){
+  const d = (snap && snap.data) || {};
+  const p = (snap && snap.procs) || {};
+  last.snap = snap;
+
+  const running = !!p.running;
+  const cls = running ? 'on' : 'bad';
+  $('#dotStack').className = 'dot ' + cls;
+  $('#dotStack2').className = 'dot ' + cls;
+  $('#stackInfo').textContent = running ? `${p.count} 进程` : '未运行';
+  // [slowroads App 自动接入 + 主页默认 2026-09-30] 画面源自动切换（全端统一，只在变化时切）
+  const sr = d.slowroads || {};
+  const home = !!d.home;
+  const wantView = (sr.open && !home) ? 'sr' : 'op';
+  // 画面源只在 sr/op 之间切换时重取（避免 home 变化导致无谓重取）
+  if (wantView !== last.stream){
+    last.stream = wantView;
+    if (typeof schedule === 'function') schedule(0);   // 立即换源重取一帧
+  }
+  // 标题（home 变化也要更新）
+  const viewKey = wantView + (home ? '+home' : '');
+  if (viewKey !== last.view){
+    last.view = viewKey;
+    const t = $('#opTitle');
+    if (t) t.textContent = (wantView === 'sr') ? 'slowroads 实时画面' : (home ? 'openpilot 主页' : 'openpilot 主机画面');
+  }
+  $('#dotCam').className = 'dot ' + (wantView === 'sr' ? (sr.open ? 'on' : 'bad') : (d.camera ? 'on' : (running ? '' : 'bad')));
+  $('#dotData').className = 'dot ' + (d.modelV2 ? 'on' : 'bad');
+  $('#updT').textContent = new Date().toLocaleTimeString('zh-CN', {hour12:false});
+  $('#starting').classList.toggle('hide', !(running && !d.modelV2));
+
+  const cs = d.carState, ss = d.selfdriveState, mv = d.modelV2, rs = d.radarState,
+        cc = d.carControl, cp = d.carParams;
+  const eng = !!(ss && (ss.enabled || ss.active));
+  const rr = d.rates || {};
+  const hzM = rr.model !== undefined ? rr.model : 0, hzC = rr.camera !== undefined ? rr.camera : 0;
+
+  // [slowroads App 自动接入 + 主页默认 2026-09-30] 状态行按当前画面源切换
+  const homeHint = home ? ' ｜ 主页模式' : '';
+  if (wantView === 'sr'){
+    $('#camInfo').textContent = sr.connected ? `已接入 openpilot ｜ 模型 ${f1(hzM)}Hz` : '正在接入 openpilot…';
+  } else {
+    $('#camInfo').textContent = d.camera
+      ? (d.video_ended ? `已播完（定格最后一帧）｜ 模型 ${f1(hzM)}Hz ｜ 相机 ${f1(hzC)}Hz`
+                       : `帧 ${d.camera.frameId} ｜ 模型 ${f1(hzM)}Hz ｜ 相机 ${f1(hzC)}Hz`) + homeHint
+      : (home ? '主页模式（未在推理）' : '');
+  }
+  $('#topInfo').textContent = running
+    ? `${p.count} 进程 · ${eng ? '已接管' : (ss && ss.engageable ? '可接管' : '未接管')}`
+      + (cs ? ` · ${(cs.vEgo * 3.6).toFixed(0)} km/h` : '')
+    : '未运行';
+
+  const engHtml = ss ? (eng ? '<span class="ok">已接管</span>'
+    : (ss.engageable ? '<span class="warn">可接管</span>' : '<span class="dimc">未接管</span>')) : '-';
+  $('#rEng').innerHTML = engHtml;
+  $('#sEngage').innerHTML = engHtml;
+  $('#rMhz').textContent = f1(hzM) + ' Hz';
+  $('#rChz').textContent = f1(hzC) + ' Hz';
+  $('#rFrame').textContent = mv ? (d.video_ended ? '已播完' : mv.frameId) : '-';
+  $('#sVego').textContent = cs ? `${cs.vEgo.toFixed(1)} m/s (${(cs.vEgo*3.6).toFixed(0)} km/h)` : '-';
+  $('#sAccel').textContent = cc ? `${cc.accel>=0?'+':''}${cc.accel.toFixed(2)} m/s²` : '-';
+  $('#sSteer').textContent = cs ? `${cs.steeringAngleDeg.toFixed(1)}°` : '-';
+  $('#sCar').textContent = cp && cp.fingerprint ? cp.fingerprint : '-';
+  $('#sLong').innerHTML = cp ? (cp.openpilotLongitudinalControl ? '<span class="ok">开（op 纵向）</span>' : '<span class="dimc">关</span>') : '-';
+
+  if (mv && mv.laneLineProbs && mv.laneLineProbs.length)
+    $('#sLanes').textContent = mv.laneLineProbs.map(v => Number(v).toFixed(2)).join(' / ');
+  else $('#sLanes').textContent = '-';
+
+  if (mv && mv.laneLines && mv.laneLines.length >= 3){
+    const yAt0 = l => {
+      if (!l.x || !l.y || !l.x.length) return null;
+      let j = 0; for (let k = 1; k < l.x.length; k++) if (Math.abs(l.x[k]) < Math.abs(l.x[j])) j = k;
+      return l.y[j];
+    };
+    const a = yAt0(mv.laneLines[1]), b = yAt0(mv.laneLines[2]);
+    const pA = (mv.laneLineProbs || [])[1], pB = (mv.laneLineProbs || [])[2];
+    if (a !== null && b !== null && pA > 0.3 && pB > 0.3){
+      const off = (a + b) / 2;
+      const side = Math.abs(off) < 0.15 ? '居中' : (off > 0 ? '偏右' : '偏左');
+      $('#sLaneOff').textContent = `${side} ${Math.abs(off).toFixed(2)} m`;
+    } else $('#sLaneOff').textContent = '车道线不足';
+  } else $('#sLaneOff').textContent = '-';
+  $('#sHz').textContent = `${f1(hzM)} / ${f1(hzC)} Hz`;
+
+  const lo = rs && rs.leadOne;
+  const lv3 = (mv && mv.leadsV3 && mv.leadsV3[0]) ? mv.leadsV3[0] : null;
+  const prob = lv3 ? lv3.prob : null;
+  const adopted = !!(lo && lo.present);
+  $('#sLeadD').textContent = adopted ? `${lo.dRel.toFixed(1)} m`
+    : (lv3 && prob > 0.1 ? `未采纳（模型看到 ${lv3.x[0].toFixed(0)} m）` : '-');
+  $('#sLeadV').textContent = adopted ? `${lo.vRel>=0?'+':''}${lo.vRel.toFixed(1)} m/s` : '-';
+  $('#sLeadP').innerHTML = prob === null ? '-' : (prob > 0.5
+    ? `<span class="ok">${prob.toFixed(2)} ✓ op 已采纳</span>` : `<span class="dimc">${prob.toFixed(2)} · 未达 0.5</span>`);
+  $('#sCruise').textContent = cs && cs.cruise
+    ? `${cs.cruise.enabled?'开':'关'}${cs.cruise.speed?(' / '+(cs.cruise.speed*3.6).toFixed(0)+' km/h'):''}` : '-';
+
+  const longOn = d.demoLong === true;
+  $('#btnLong').className = longOn ? 'on' : '';
+  $('#btnLong').textContent = longOn ? '● 已开启（纵向接管中）' : '● 未接管（点此开启）';
+  const perfOn = d.perfAlert === true;
+  $('#btnPerf').className = perfOn ? 'on' : '';
+  $('#btnPerf').textContent = perfOn ? '● 已开启（延迟时报警）' : '○ 已关闭（不报警）';
+
+  const mb = d.modelBackend || {};
+  const curBe = mb.running || null, setBe = mb.setting || 'coreml';
+  $('#btnAne').className = (setBe === 'coreml') ? 'on' : '';
+  $('#btnMetal').className = (setBe === 'tinygrad') ? 'on' : '';
+  $('#rBackend').innerHTML = curBe === 'coreml' ? '<span class="ok">🧠 ANE 神经引擎</span>'
+    : (curBe === 'tinygrad' ? '⚙ Metal（tinygrad）' : '<span class="dimc">未运行</span>');
+
+  /* 指示器 */
+  const ind = d.indicator || {};
+  const setLane = (el, pr) => {
+    const on = Number(pr || 0) >= 0.5;
+    el.setAttribute('fill', on ? '#e6edf3' : 'none');
+    el.setAttribute('stroke', on ? '#e6edf3' : '#3a4656');
+    el.setAttribute('stroke-width', on ? '1.2' : '1.6');
+    el.setAttribute('stroke-dasharray', on ? '' : '5 4');
+    return on;
+  };
+  const onL = setLane($('#laneLShape'), ind.laneL);
+  const onR = setLane($('#laneRShape'), ind.laneR);
+  const aebOn = !!ind.aeb;
+  $('#leadCar').style.display = (ind.lead || aebOn) ? '' : 'none';
+  $('#leadCar').classList.toggle('aeb', aebOn);
+  const mBars = Number(ind.bars || 0);
+  [['#bar1',1],['#bar2',2],['#bar3',3]].forEach(([sel, i]) => {
+    const el = $(sel), on = i <= mBars;
+    el.setAttribute('fill', on ? '#3ee06e' : '#1a2230');
+    el.setAttribute('stroke', on ? '#3ee06e' : '#2a3444');
+  });
+  const modeTxt = (MODE_CN[ind.mode] || '-') + (mBars ? ` · ${mBars} 格` : '');
+  $('#indLead').innerHTML = aebOn
+    ? `<span class="aebtxt">⚠ AEB 紧急制动${ind.leadDist != null ? ' · ' + Number(ind.leadDist).toFixed(1) + ' m' : ''}</span>`
+    : (ind.lead ? `<span class="ok">有前车${ind.leadDist != null ? ' · ' + Number(ind.leadDist).toFixed(1) + ' m' : ''}</span>` : '无前车');
+  $('#indL').innerHTML = onL ? `<span class="ok">实心 · ${Number(ind.laneL).toFixed(2)}</span>`
+                             : `<span class="dimc">空心 · ${Number(ind.laneL).toFixed(2)}</span>`;
+  $('#indR').innerHTML = onR ? `<span class="ok">实心 · ${Number(ind.laneR).toFixed(2)}</span>`
+                             : `<span class="dimc">空心 · ${Number(ind.laneR).toFixed(2)}</span>`;
+  $('#indModeBars').textContent = modeTxt;
+  $('#indMode').textContent = modeTxt;
+  $('#dotInd').className = 'dot' + (d.seen && d.seen.modelV2 ? ' on' : '');
+
+  /* 方向盘 / 踏板 */
+  const deg = cs ? cs.steeringAngleDeg : 0;
+  const wheelDeg = Math.max(-540, Math.min(540, deg));
+  $('#wheelSvg').style.transform = `rotate(${(-wheelDeg).toFixed(1)}deg)`;
+  const arcEl = $('#scaleArc'), aw = Math.abs(deg);
+  if (cs && aw >= 1.5){
+    const r = 53.5, lim = Math.max(-180, Math.min(180, deg));
+    const rad = lim * Math.PI / 180;
+    const x1 = 60 - r * Math.sin(rad), y1 = 60 - r * Math.cos(rad);
+    arcEl.setAttribute('d', `M 60 ${(60-r).toFixed(1)} A ${r} ${r} 0 0 ${lim>0?0:1} ${x1.toFixed(1)} ${y1.toFixed(1)}`);
+    arcEl.setAttribute('stroke', deg > 0 ? '#4ea1ff' : '#ffa94d');
+    arcEl.setAttribute('opacity', '.92');
+  } else arcEl.setAttribute('opacity', '0');
+  const wEl = $('#wheelDeg');
+  if (!cs){ wEl.textContent = '-'; wEl.className = 'c0'; }
+  else if (aw < 1.5){ wEl.textContent = '居中'; wEl.className = 'c0'; }
+  else { wEl.textContent = `${deg>0?'左':'右'} ${aw.toFixed(0)}°`; wEl.className = deg > 0 ? 'cL' : 'cR'; }
+
+  let brakePct = cc ? Math.max(0, Math.min(1, cc.brake)) * 100 : 0;
+  let gasPct = cc ? Math.max(0, Math.min(1, cc.gas)) * 100 : 0;
+  if (cc && brakePct < 0.5 && gasPct < 0.5 && Math.abs(cc.accel) > 0.15){
+    if (cc.accel > 0) gasPct = Math.min(1, cc.accel / 2.0) * 100;
+    else brakePct = Math.min(1, -cc.accel / 3.5) * 100;
+  }
+  $('#brakeFill').style.height = brakePct.toFixed(0) + '%';
+  $('#gasFill').style.height = gasPct.toFixed(0) + '%';
+  $('#brakeTxt').textContent = brakePct.toFixed(0) + '%';
+  $('#gasTxt').textContent = gasPct.toFixed(0) + '%';
+
+  /* 播放控制 / 系统负载 */
+  const pb2 = d.playback || {};
+  const paused = pb2.pause === true;
+  $('#btnPause').textContent = paused ? '▶ 继续' : '⏸ 暂停';
+  $('#btnPause').className = paused ? 'on' : '';
+  const spd = (pb2.speed !== undefined) ? Number(pb2.speed) : 1;
+  $('#btnSpeed').textContent = '⏩ ' + spd.toFixed(1) + 'x';
+  $('#btnSpeed').className = (spd !== 1) ? 'on' : '';
+  const sy = d.sys;
+  $('#rLoad').textContent = sy ? `${sy.load1.toFixed(1)} / ${sy.load5.toFixed(1)}（${sy.ncpu} 核）` : '-';
+  $('#rMem').textContent = (sy && sy.mem_total_gb) ? `${sy.mem_used_gb.toFixed(1)} / ${sy.mem_total_gb.toFixed(0)} GB` : '-';
+
+  /* 标定 */
+  const cb = d.calib;
+  if (cb){
+    const ci = $('#calibInfo');
+    if (cb.status === 'calibrated'){ ci.textContent = '标定：已校准 ✓（' + (cb.validBlocks|0) + ' 块）'; ci.style.color = '#8ce99a'; }
+    else if (cb.status === 'calibrating'){ ci.textContent = '标定：校准中 ' + (cb.perc|0) + '%（需要 >24km/h 直线行驶）'; ci.style.color = '#ffd479'; }
+    else { ci.textContent = '标定：未校准（需要 >24km/h 直线行驶）'; ci.style.color = '#ffd479'; }
+  }
+
+  const al = $('#alert');
+  if (ss && (ss.alertText1 || ss.alertText2)){
+    al.className = 'show';
+    al.textContent = [ss.alertText1, ss.alertText2].filter(Boolean).join(' · ');
+  } else al.className = '';
+}
+
+/* ---------------- SSE ---------------- */
+function connect(){
+  const es = new EventSource(API + 'stream');
+  es.onmessage = ev => { try { update(JSON.parse(ev.data)); } catch(e){} };
+  es.onerror = () => {
+    $('#dotData').className = 'dot bad';
+    $('#conn').className = 'bad'; $('#conn').textContent = '连接断开 · 重连中';
+    es.close(); setTimeout(connect, 1500);
+  };
+  es.onopen = () => { $('#conn').className = 'on'; $('#conn').textContent = '已连接'; };
+}
+// 手机切后台会挂起 SSE/轮询，回到前台立刻重连
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden){ pumpOn = true; schedule(0); }
+});
+
+/* ---------------- 标签栏（手机） ---------------- */
+function showTab(t){
+  last.tab = t;
+  document.querySelectorAll('#tabbar button').forEach(b => b.classList.toggle('sel', b.dataset.tab === t));
+  document.querySelectorAll('.panel').forEach(p => p.classList.toggle('active', p.dataset.panel === t));
+  if (t === 'log') loadLog(last.logName);
+  window.scrollTo(0, 0);
+}
+document.querySelectorAll('#tabbar button').forEach(b => b.onclick = () => showTab(b.dataset.tab));
+
+/* ---------------- 日志 ---------------- */
+async function loadLog(name){
+  last.logName = name;
+  try {
+    const j = await (await fetch(API + 'log?name=' + name)).json();
+    const box = $('#logbox');
+    const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
+    // 日志里带 ANSI 颜色转义码（桌面版原样显示，手机上更花）→ 剥掉，只留纯文本
+    const clean = (j.text || '').replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
+    box.textContent = clean.split('\n').slice(-220).join('\n') || '(空)';
+    if (atBottom) box.scrollTop = box.scrollHeight;
+  } catch(e){}
+}
+document.querySelectorAll('[data-log]').forEach(b => b.onclick = () => {
+  document.querySelectorAll('[data-log]').forEach(x => x.classList.remove('sel'));
+  b.classList.add('sel'); loadLog(b.dataset.log);
+});
+setInterval(() => { if (last.tab === 'log' || window.innerWidth >= 820) loadLog(last.logName); }, 2500);
+
+/* ---------------- 素材 ---------------- */
+async function loadMaterials(){
+  try {
+    const j = await (await fetch(API + 'materials')).json();
+    const g = $('#selGroup'), f = $('#selFile');
+    g.innerHTML = ''; (j.groups || []).forEach(x => g.add(new Option(x.group, x.group)));
+    const fill = () => {
+      const grp = (j.groups || []).find(x => x.group === g.value);
+      f.innerHTML = '';
+      (grp ? grp.files : []).forEach(x => f.add(new Option(x.name, x.path)));
+    };
+    g.onchange = fill; fill();
+  } catch(e){}
+}
+
+/* ---------------- 点击画面 → 转发给 op UI ---------------- */
+let _pd = null;
+const opEl = () => $('#opScreen');
+document.addEventListener('pointerdown', ev => {
+  if (ev.target !== opEl()) return;
+  _pd = {x: ev.clientX, y: ev.clientY};
+}, {passive:true});
+document.addEventListener('pointerup', async ev => {
+  if (ev.target !== opEl() || !_pd) { _pd = null; return; }
+  if (last.view === 'sr') { _pd = null; return; }   // [slowroads 视图 2026-09-30] 游戏画面只读，点击不转发给 op
+  const dx = ev.clientX - _pd.x, dy = ev.clientY - _pd.y;
+  _pd = null;
+  if (Math.hypot(dx, dy) > 10) return;            // 滑动 → 不转发
+  const el = opEl(), r = el.getBoundingClientRect();
+  // 因为 img 用 width/height auto，元素框就是画面框 → 归一化即精确
+  const x = Math.min(1, Math.max(0, (ev.clientX - r.left) / r.width));
+  const y = Math.min(1, Math.max(0, (ev.clientY - r.top) / r.height));
+  const wrap = $('#viewWrap').getBoundingClientRect();
+  const rip = document.createElement('div');
+  rip.className = 'ripple';
+  rip.style.left = (ev.clientX - wrap.left) + 'px';
+  rip.style.top = (ev.clientY - wrap.top) + 'px';
+  $('#viewWrap').appendChild(rip);
+  setTimeout(() => rip.remove(), 600);
+  const res = await post('api/click', {x, y});
+  if (res && res.ok === false) toast('点击转发失败：' + (res.error || '未知错误'), 3000);
+});
+
+/* ---------------- 控制台按钮 ---------------- */
+$('#btnStop').onclick = async () => { await post('api/stop'); toast('正在停止…'); };
+// [恢复到主页 2026-09-30] 一键：切出 + 停止当前推理 → 退回 op 主页
+$('#btnHome').onclick = async () => {
+  const j = await post('api/home');
+  toast(j && j.msg ? j.msg : '正在回到主页…', 4000);
+};
+$('#btnRecalib').onclick = async () => {
+  const j = await post('api/recalibrate');
+  toast(j.ok ? (j.msg || '已触发重新校准') : ('失败：' + j.error), 6000);
+};
+$('#btnRestoreCalib').onclick = async () => {
+  const j = await post('api/restore_calib');
+  toast(j.ok ? (j.msg || '已恢复预置标定') : ('失败：' + j.error), 6000);
+};
+$('#btnPlaySel').onclick = async () => {
+  const p = $('#selFile').value;
+  if (!p){ toast('请选择素材'); return; }
+  await post('api/import', {path:p});
+  toast('正在启动（免转码）：' + p.split('/').pop(), 4000);
+};
+/* 导出：既存到 Mac 桌面（后端行为不变），也下载到本机 */
+function download(path){
+  const a = document.createElement('a');
+  a.href = API + 'download?path=' + encodeURIComponent(path);
+  a.download = path.split('/').pop();
+  document.body.appendChild(a); a.click(); a.remove();
+}
+$('#btnShot').onclick = async () => {
+  const j = await post('api/export/opscreen');
+  if (j.ok){ toast('已存 Mac 桌面，并下载到本机：' + j.path.split('/').pop(), 4000); download(j.path); }
+  else toast('失败：' + j.error, 4000);
+};
+$('#btnData').onclick = async () => {
+  const j = await post('api/export/data');
+  if (j.ok){ toast('已存 Mac 桌面，并下载到本机：' + j.path.split('/').pop(), 4000); download(j.path); }
+  else toast('失败：' + j.error, 4000);
+};
+$('#btnLong').onclick = async () => {
+  const cur = (last.snap && last.snap.data) ? !!last.snap.data.demoLong : false;
+  await post('api/long', {enabled: !cur});
+  toast(!cur ? '已开启纵向接管（模拟按巡航键接管）' : '已关闭纵向接管（发 CANCEL 解除）');
+};
+$('#btnPerf').onclick = async () => {
+  const cur = (last.snap && last.snap.data) ? !!last.snap.data.perfAlert : false;
+  await post('api/perf_alert', {enabled: !cur});
+  toast(!cur ? '已开启性能提示（延迟报警会显示并响铃）' : '已关闭性能提示（不再显示/响铃）');
+};
+async function setBackend(be){
+  const cur = (last.snap && last.snap.data && last.snap.data.modelBackend) ? last.snap.data.modelBackend : {};
+  const name = be === 'coreml' ? 'ANE 神经引擎' : 'Metal（tinygrad）';
+  if (cur.setting === be && cur.running === be){ toast('现在就是 ' + name); return; }
+  const j = await post('api/model_backend', {backend: be});
+  if (!j.ok){ toast('切换失败：' + (j.error || '未知错误'), 4000); return; }
+  toast(j.restarted ? ('已切到 ' + name + '，正在自动重启演示（约 40 秒）…') : ('已保存：' + name + '（下次启动生效）'), 5000);
+}
+$('#btnAne').onclick = () => setBackend('coreml');
+$('#btnMetal').onclick = () => setBackend('tinygrad');
+$('#btnPause').onclick = async () => {
+  const cur = (last.snap && last.snap.data && last.snap.data.playback) ? !!last.snap.data.playback.pause : false;
+  await post('api/playback', {pause: !cur});
+  toast(!cur ? '已暂停（保持当前帧）' : '已继续播放');
+};
+$('#btnSpeed').onclick = async () => {
+  const cur = (last.snap && last.snap.data && last.snap.data.playback) ? Number(last.snap.data.playback.speed || 1) : 1;
+  const next = cur === 1 ? 2 : (cur === 2 ? 0.5 : 1);
+  await post('api/playback', {speed: next});
+  toast('播放倍速：' + next + 'x');
+};
+$('#btnRestart').onclick = async () => { await post('api/playback', {restart:true}); toast('从头重播'); };
+$('#btnQuit').onclick = async () => {
+  if (!confirm('退出全部？将停止 op 并关闭控制台。')) return;
+  await post('api/quit'); toast('正在退出…', 4000);
+};
+
+/* ---------------- 导入：① 浏览 Mac 目录 ② 手机上传 ---------------- */
+const sheet = $('#sheet');
+function openSheet(which){
+  sheet.classList.add('show');
+  $('#fsPane').hidden = which !== 'mac';
+  $('#upPane').hidden = which !== 'phone';
+  if (which === 'mac') loadFs(null);
+}
+$('#btnImport').onclick = () => openSheet(null);
+$('#btnCloseSheet').onclick = () => sheet.classList.remove('show');
+sheet.onclick = ev => { if (ev.target === sheet) sheet.classList.remove('show'); };
+$('#btnBrowseMac').onclick = () => openSheet('mac');
+$('#btnUploadPhone').onclick = () => openSheet('phone');
+
+let fsCwd = null;
+async function loadFs(path){
+  const list = $('#fsList');
+  list.innerHTML = '<div class="fsempty">加载中…</div>';
+  try {
+    const j = await (await fetch(API + 'fs' + (path ? '?path=' + encodeURIComponent(path) : ''))).json();
+    if (!j.ok){ list.innerHTML = `<div class="fsempty">${esc(j.error || '读取失败')}</div>`; return; }
+    fsCwd = j.cwd;
+    $('#fsCrumb').innerHTML = `<b>${esc(j.cwd)}</b>`;
+    $('#fsRoots').innerHTML = (j.roots || []).map(r =>
+      `<button class="ghost" data-root="${esc(r.path)}"
+        style="flex:0 0 auto;min-height:34px;padding:5px 11px;font-size:12.5px;border-radius:9px">📌 ${esc(r.name)}</button>`).join('');
+    document.querySelectorAll('#fsRoots [data-root]').forEach(b =>
+      b.onclick = () => loadFs(b.dataset.root));
+
+    const rows = [];
+    if (j.parent) rows.push(`<div class="fsitem" data-dir="${esc(j.parent)}"><span class="ic">↩️</span><span class="nm">.. 上一级</span></div>`);
+    (j.dirs || []).forEach(d => rows.push(
+      `<div class="fsitem" data-dir="${esc(d.path)}"><span class="ic">📁</span><span class="nm">${esc(d.name)}</span></div>`));
+    (j.files || []).forEach(f => rows.push(
+      `<div class="fsitem ${f.video ? 'video' : ''}" data-file="${esc(f.path)}" data-size="${f.size}">
+         <span class="ic">${f.video ? '🎬' : '📄'}</span><span class="nm">${esc(f.name)}</span>
+         <span class="sz">${fmtSize(f.size)}</span></div>`));
+    list.innerHTML = rows.length ? rows.join('') : '<div class="fsempty">（空目录）</div>';
+
+    list.querySelectorAll('[data-dir]').forEach(el => el.onclick = () => loadFs(el.dataset.dir));
+    list.querySelectorAll('[data-file]').forEach(el => el.onclick = async () => {
+      const p = el.dataset.file, sz = Number(el.dataset.size || 0);
+      if (sz > 200 * 1048576 && !confirm(`这个文件 ${fmtSize(sz)}，确定要导入吗？`)) return;
+      sheet.classList.remove('show');
+      await post('api/import', {path:p});
+      toast('正在启动（免转码）：' + p.split('/').pop(), 4000);
+    });
+  } catch(e){ list.innerHTML = `<div class="fsempty">读取失败：${esc(e.message)}</div>`; }
+}
+
+$('#btnPickPhone').onclick = () => $('#fileInput').click();
+$('#fileInput').onchange = () => {
+  const f = $('#fileInput').files[0];
+  if (!f) return;
+  uploadPhone(f);
+};
+function uploadPhone(file){
+  $('#upProg').hidden = false;
+  $('#upHint').textContent = `${file.name} · ${fmtSize(file.size)}。上传期间请保持屏幕常亮（息屏会中断上传）。`;
+  const xhr = new XMLHttpRequest();
+  const url = API + 'upload?name=' + encodeURIComponent(file.name);
+  xhr.open('POST', url);
+  xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+  xhr.upload.onprogress = ev => {
+    if (!ev.lengthComputable) return;
+    const p = ev.loaded / ev.total * 100;
+    $('#upBar').style.width = p.toFixed(1) + '%';
+    $('#upTxt').textContent = `${p.toFixed(1)}%　${fmtSize(ev.loaded)} / ${fmtSize(ev.total)}`;
+  };
+  xhr.onload = async () => {
+    let j = {};
+    try { j = JSON.parse(xhr.responseText); } catch(e){}
+    if (j.ok){
+      $('#upBar').style.width = '100%';
+      $('#upTxt').textContent = '上传完成，正在启动…';
+      sheet.classList.remove('show');
+      toast('上传完成：' + j.name, 3000);
+      await post('api/import', {path: j.path});
+    } else {
+      $('#upTxt').textContent = '上传失败：' + (j.error || xhr.status);
+      toast('上传失败：' + (j.error || xhr.status), 5000);
+    }
+  };
+  xhr.onerror = () => { $('#upTxt').textContent = '上传中断（网络或息屏导致）'; toast('上传中断，请保持屏幕常亮后重试', 5000); };
+  xhr.send(file);
+}
+
+/* ---------------- 方向盘刻度盘 ---------------- */
+(() => {
+  const NS = 'http://www.w3.org/2000/svg', g = $('#scaleTicks');
+  if (!g) return;
+  for (let a = -180; a < 180; a += 15){
+    const major = (a % 45 === 0);
+    const rad = (a - 90) * Math.PI / 180;
+    const r1 = major ? 49 : 52.5, r2 = 58;
+    const l = document.createElementNS(NS, 'line');
+    l.setAttribute('x1', (60 + r1 * Math.cos(rad)).toFixed(1));
+    l.setAttribute('y1', (60 + r1 * Math.sin(rad)).toFixed(1));
+    l.setAttribute('x2', (60 + r2 * Math.cos(rad)).toFixed(1));
+    l.setAttribute('y2', (60 + r2 * Math.sin(rad)).toFixed(1));
+    l.setAttribute('stroke', major ? 'rgba(255,255,255,.42)' : 'rgba(255,255,255,.15)');
+    l.setAttribute('stroke-width', major ? '2' : '1.1');
+    l.setAttribute('stroke-linecap', 'round');
+    g.appendChild(l);
+  }
+})();
+
+/* ---------------- 启动 ---------------- */
+setQual('std');
+loadMaterials();
+connect();
+loadLog('stack');
+</script>
+</body>
+</html>

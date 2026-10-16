@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>openpilot 网页版</title>
+<style>
+  :root{
+    --bg:#0b0e13; --panel:#11161e; --panel2:#0e131a; --line:#1f2733;
+    --fg:#e6edf3; --dim:#8b98a8; --green:#3ee06e; --red:#e5484d; --yellow:#daca25; --blue:#4ea1ff;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",sans-serif}
+  .wrap{max-width:1000px;margin:0 auto;padding:22px 24px 28px}
+
+  header{display:flex;align-items:center;gap:14px;margin-bottom:20px}
+  .logo{width:46px;height:46px;border-radius:13px;flex:0 0 auto;display:flex;align-items:center;
+    justify-content:center;font-size:24px;background:linear-gradient(160deg,#1b2735,#0d131c);
+    border:1px solid #26303e}
+  h1{margin:0;font-size:19px;font-weight:650;letter-spacing:.2px}
+  .sub{color:var(--dim);font-size:12.5px;margin-top:2px}
+  .pill{margin-left:auto;font-size:12.5px;padding:6px 14px;border-radius:20px;white-space:nowrap;
+    background:#1a2230;border:1px solid #2a3444;color:var(--dim);font-weight:600}
+  .pill.on{color:#b6f7cd;border-color:#256b41;background:#173a25}
+  .pill.bad{color:#ffc9cb;border-color:#6b2529;background:#3a1a1d}
+  .pill.warn{color:#ffe9a8;border-color:#6b5f25;background:#3a3418}
+
+  .offline{display:none;margin-bottom:16px;padding:12px 16px;border-radius:12px;font-size:13px;
+    background:#3a1418;border:1px solid #7f1d1d;color:#fca5a5}
+  .offline.show{display:block}
+
+  .addr{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:14px}
+  @media (max-width:760px){.addr{grid-template-columns:1fr}}
+  .addrCard{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:15px 16px}
+  .lbl{font-size:11.5px;color:var(--dim);letter-spacing:.4px;margin-bottom:8px}
+  .url{font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;color:#cfe3ff;
+    word-break:break-all;min-height:19px;margin-bottom:12px}
+  .btns{display:flex;gap:8px}
+  .btn{font:inherit;font-size:13px;padding:8px 16px;border-radius:9px;cursor:pointer;
+    background:#1a2230;border:1px solid #2a3444;color:var(--fg);text-decoration:none;
+    display:inline-flex;align-items:center;min-height:36px;transition:.12s}
+  .btn:hover{background:#222d3d}
+  .btn.primary{background:#173a25;border-color:#256b41;color:#b6f7cd}
+  .btn.primary:hover{background:#1d4a30}
+  .btn[disabled]{opacity:.4;pointer-events:none}
+
+  .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:14px}
+  @media (max-width:980px){.grid{grid-template-columns:repeat(2,1fr)}}
+  @media (max-width:520px){.grid{grid-template-columns:1fr}}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px 16px}
+  .clbl{font-size:11.5px;color:var(--dim);letter-spacing:.4px;margin-bottom:7px}
+  .cval{font-size:16px;font-weight:650;display:flex;align-items:center;gap:8px}
+  .cnote{font-size:11.5px;color:var(--dim);margin-top:6px;line-height:1.45}
+  .dot{width:9px;height:9px;border-radius:50%;background:#39424f;flex:0 0 auto}
+  .dot.on{background:var(--green);box-shadow:0 0 7px var(--green)}
+  .dot.bad{background:var(--red);box-shadow:0 0 7px var(--red)}
+  .dot.warn{background:var(--yellow);box-shadow:0 0 7px var(--yellow)}
+  .ok{color:var(--green)} .badc{color:var(--red)} .warnc{color:var(--yellow)} .dimc{color:var(--dim)}
+
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+    padding:14px 16px;margin-bottom:14px}
+  .panel h2{margin:0 0 10px;font-size:13px;font-weight:600;color:#cfe3ff;
+    display:flex;align-items:center;gap:8px}
+  .tag{font-size:11px;padding:2px 9px;border-radius:20px;background:#1a2230;border:1px solid #2a3444;
+    color:var(--dim);font-weight:600}
+  .tag.bad{color:#ffc9cb;border-color:#6b2529;background:#3a1a1d}
+  .errs{font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;color:#9fb0c2;
+    max-height:190px;overflow:auto;white-space:pre-wrap;word-break:break-all}
+  .errs .none{color:var(--dim);font-family:inherit}
+  .errs .e{color:#f0a5a8;padding:3px 0;border-bottom:1px dashed #1a212b}
+  .warns{margin:0;padding-left:18px;color:var(--dim);font-size:12.5px;line-height:1.75}
+  .warns li::marker{color:#4a5568}
+
+  footer{display:flex;gap:12px;color:var(--dim);font-size:11.5px;padding-top:6px}
+  footer .right{margin-left:auto}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <header>
+    <div class="logo">🌐</div>
+    <div>
+      <h1>openpilot 网页版</h1>
+      <div class="sub" id="sub">正在读取状态…</div>
+    </div>
+    <div class="pill" id="pill">连接中</div>
+  </header>
+
+  <div class="offline" id="offline">⚠ 网页服务无响应，正在重试…（关闭本窗口会尝试停掉服务）</div>
+
+  <section class="addr">
+    <div class="addrCard">
+      <div class="lbl">本地地址 · 这台 Mac 上打开</div>
+      <div class="url" id="localUrl">—</div>
+      <div class="btns">
+        <a class="btn primary" id="openLocal" href="#" target="_blank" rel="noopener">打开</a>
+        <button class="btn" id="copyLocal">复制</button>
+      </div>
+    </div>
+    <div class="addrCard">
+      <div class="lbl">Tailscale 地址 · 手机 / iPad 打开（仅内网，需密码）</div>
+      <div class="url" id="tsUrl">—</div>
+      <div class="btns">
+        <a class="btn primary" id="openTs" href="#" target="_blank" rel="noopener">打开</a>
+        <button class="btn" id="copyTs">复制</button>
+      </div>
+    </div>
+  </section>
+
+  <section class="grid">
+    <div class="card">
+      <div class="clbl">网页服务</div>
+      <div class="cval"><span class="dot" id="dSvc"></span><span id="vSvc">—</span></div>
+      <div class="cnote" id="nSvc"></div>
+    </div>
+    <div class="card">
+      <div class="clbl">Tailscale 发布</div>
+      <div class="cval"><span class="dot" id="dTs"></span><span id="vTs">—</span></div>
+      <div class="cnote" id="nTs"></div>
+    </div>
+    <div class="card">
+      <div class="clbl">op 演示栈</div>
+      <div class="cval"><span class="dot" id="dOp"></span><span id="vOp">—</span></div>
+      <div class="cnote" id="nOp"></div>
+    </div>
+    <div class="card">
+      <div class="clbl">桌面版 app</div>
+      <div class="cval"><span class="dot" id="dDesk"></span><span id="vDesk">—</span></div>
+      <div class="cnote" id="nDesk"></div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>报错状态 <span class="tag" id="errTag">0</span></h2>
+    <div class="errs" id="errs"><span class="none">正在读取…</span></div>
+  </section>
+
+  <section class="panel">
+    <h2>提示</h2>
+    <ul class="warns" id="warns"><li>正在读取…</li></ul>
+  </section>
+
+  <footer>
+    <span id="foot">—</span>
+    <span class="right">关闭本窗口 = 停止网页版服务</span>
+  </footer>
+
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+let last = null, fails = 0;
+
+const fmtUp = s => {
+  s = Math.floor(s);
+  if (s < 60) return s + ' 秒';
+  if (s < 3600) return Math.floor(s / 60) + ' 分 ' + (s % 60) + ' 秒';
+  return Math.floor(s / 3600) + ' 小时 ' + Math.floor((s % 3600) / 60) + ' 分';
+};
+const esc = s => String(s == null ? '' : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+
+function copy(text, btn){
+  const done = () => { const t = btn.textContent; btn.textContent = '已复制 ✓';
+                       setTimeout(() => btn.textContent = t, 1400); };
+  if (navigator.clipboard && window.isSecureContext !== false) {
+    navigator.clipboard.writeText(text).then(done).catch(() => fallback(text, done));
+  } else fallback(text, done);
+}
+function fallback(text, done){
+  const ta = document.createElement('textarea');
+  ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+  document.body.appendChild(ta); ta.select();
+  try { document.execCommand('copy'); done(); } catch(e){}
+  ta.remove();
+}
+
+function render(j){
+  last = j;
+  $('#offline').classList.remove('show');
+
+  const svcUp = j.backend && j.backend.running;
+  const tsUp  = j.tailscale && j.tailscale.mounted;
+  const opUp  = j.op && j.op.running;
+  const desk  = j.desktop_app && j.desktop_app.running;
+
+  const allOk = svcUp && tsUp;
+  const pill = $('#pill');
+  pill.className = 'pill ' + (allOk ? 'on' : (svcUp ? 'warn' : 'bad'));
+  pill.textContent = allOk ? '● 服务正常' : (svcUp ? '● 部分异常' : '● 服务异常');
+  $('#sub').textContent = `更新于 ${new Date().toLocaleTimeString('zh-CN', {hour12:false})} · 每 2 秒自动刷新`;
+
+  // 地址
+  $('#localUrl').textContent = j.local_url || '—';
+  $('#openLocal').href = j.local_url || '#';
+  $('#copyLocal').disabled = !j.local_url;
+  const tsUrl = (j.tailscale && j.tailscale.url) || (j.tailscale && j.tailscale.expected_url) || '';
+  $('#tsUrl').textContent = tsUrl || '（未挂载）';
+  $('#openTs').href = tsUrl || '#';
+  $('#copyTs').disabled = !tsUrl;
+
+  // 网页服务
+  $('#dSvc').className = 'dot ' + (svcUp ? 'on' : 'bad');
+  $('#vSvc').innerHTML = svcUp ? '<span class="ok">运行中</span>' : '<span class="badc">未运行</span>';
+  $('#nSvc').textContent = svcUp
+    ? `PID ${j.backend.pid} · :${j.backend.port} · ${fmtUp(j.backend.uptime_s)}`
+    : '后端无响应';
+
+  // Tailscale
+  $('#dTs').className = 'dot ' + (tsUp ? 'on' : 'bad');
+  $('#vTs').innerHTML = tsUp ? '<span class="ok">已发布</span>' : '<span class="badc">未发布</span>';
+  let tsNote = tsUp ? `→ ${j.tailscale.target}` : '手机现在连不上';
+  if (j.tailscale.error) tsNote += ` · ${j.tailscale.error}`;
+  $('#nTs').textContent = tsNote;
+
+  // op 栈
+  $('#dOp').className = 'dot ' + (opUp ? 'on' : 'warn');
+  $('#vOp').innerHTML = opUp ? '<span class="ok">运行中</span>' : '<span class="warnc">未运行</span>';
+  $('#nOp').textContent = opUp ? `${j.op.count} 个进程` : '手机上只会看到「未运行」';
+
+  // 桌面版
+  $('#dDesk').className = 'dot ' + (desk ? 'on' : '');
+  $('#vDesk').innerHTML = desk ? '<span class="ok">运行中</span>' : '<span class="dimc">未运行</span>';
+  $('#nDesk').textContent = desk ? '共享的后端和 op 栈会留着' : '关闭本 app 会全部停掉';
+
+  // 报错
+  const errs = j.errors || [];
+  $('#errTag').textContent = errs.length;
+  $('#errTag').className = 'tag' + (errs.length ? ' bad' : '');
+  $('#errs').innerHTML = errs.length
+    ? errs.map(e => `<div class="e">${esc(e)}</div>`).join('')
+    : '<span class="none">✓ 没有发现异常</span>';
+
+  // 提示
+  $('#warns').innerHTML = (j.warnings || []).map(w => `<li>${esc(w)}</li>`).join('') || '<li>—</li>';
+  $('#foot').textContent = `后端启动于 ${j.backend.started_at}`;
+}
+
+async function tick(){
+  try {
+    const r = await fetch('api/webstatus', {cache: 'no-store'});
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    render(await r.json());
+    fails = 0;
+  } catch (e) {
+    fails++;
+    $('#offline').classList.add('show');
+    if (fails >= 2){
+      $('#pill').className = 'pill bad';
+      $('#pill').textContent = '● 服务异常';
+      $('#dSvc').className = 'dot bad';
+      $('#vSvc').innerHTML = '<span class="badc">无响应</span>';
+      $('#nSvc').textContent = String(e.message || e);
+    }
+  }
+}
+
+$('#copyLocal').onclick = e => last && copy(last.local_url, e.target);
+$('#copyTs').onclick = e => {
+  const u = (last.tailscale && (last.tailscale.url || last.tailscale.expected_url)) || '';
+  if (u) copy(u, e.target);
+};
+
+tick();
+setInterval(tick, 2000);
+</script>
+</body>
+</html>

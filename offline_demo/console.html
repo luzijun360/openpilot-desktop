@@ -1,0 +1,930 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>openpilot 控制台</title>
+<style>
+  :root{
+    --bg:#0b0e13; --panel:#11161e; --panel2:#0e131a; --line:#1f2733;
+    --fg:#e6edf3; --dim:#8b98a8; --green:#3ee06e; --red:#e5484d; --yellow:#daca25;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);
+    font:13px/1.45 -apple-system,BlinkMacSystemFont,"PingFang SC","Helvetica Neue",sans-serif;overflow:hidden}
+  /* 两列：左 = op 画面(2:1) + 状态/日志；右 = 控制台 + 驾驶员监测 */
+  #grid{display:flex;gap:8px;padding:8px;height:100vh;align-items:stretch}
+  .col{display:flex;flex-direction:column;gap:8px;min-height:0;min-width:0}
+  .colL{flex:1 1 68%}
+  .colR{flex:1 1 32%}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;overflow:hidden;
+    display:flex;flex-direction:column;min-height:0;position:relative}
+  .phead{display:flex;align-items:center;gap:8px;padding:7px 12px;border-bottom:1px solid var(--line);
+    background:var(--panel2);font-size:12px;color:var(--dim);flex:0 0 auto}
+  .phead b{color:var(--fg);font-size:12.5px;font-weight:600}
+  .pbody{flex:1 1 auto;min-height:0;overflow:auto}
+  .dot{width:7px;height:7px;border-radius:50%;background:#39424f;display:inline-block;flex:0 0 auto}
+  .dot.on{background:var(--green);box-shadow:0 0 6px var(--green)}
+  .dot.bad{background:var(--red);box-shadow:0 0 6px var(--red)}
+  .dot.warn{background:var(--yellow);box-shadow:0 0 6px var(--yellow)}
+
+  /* 左上：op 原版主机画面（2:1 铺满，不留上下空） */
+  #opPanel{flex:0 0 auto;aspect-ratio:2/1;max-height:72%}
+  #viewWrap{position:relative;flex:1 1 auto;min-height:0;background:#000;display:flex}
+  #opScreen{width:100%;height:100%;object-fit:fill;display:block}
+  #alert{position:absolute;left:0;right:0;bottom:0;padding:6px 14px;font-size:12.5px;color:#ffd7d7;
+    background:linear-gradient(transparent,rgba(120,20,20,.85));opacity:0;transition:.2s;pointer-events:none}
+  #alert.show{opacity:1}
+  /* [B5 修复 2026-09-27] 启动浮层：栈在跑但模型还没出数据时显示「正在启动…」 */
+  #starting{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;
+    gap:6px;background:rgba(8,11,16,.92);color:#cfe3ff;font-size:14px;text-align:center;transition:opacity .35s;pointer-events:none}
+  #starting .sub{font-size:11.5px;color:var(--dim)}
+  #starting.hide{opacity:0}
+
+  /* 左下：状态 / 日志（分页） */
+  #statusPanel{flex:1 1 auto;min-height:0}
+  /* 右列：控制台 + 驾驶员监测 */
+  #ctrlPanel{flex:1 1 auto;min-height:0}
+
+  /* 右上：控制 */
+  .row{padding:10px 12px}
+  .row+.row{border-top:1px solid var(--line)}
+  .lbl{font-size:11px;color:var(--dim);margin-bottom:6px;letter-spacing:.5px}
+  button{background:#1a2230;color:var(--fg);border:1px solid #2a3444;border-radius:8px;
+    padding:7px 12px;font-size:12.5px;cursor:pointer;transition:.12s;font-family:inherit}
+  button:hover{background:#222d3d;border-color:#3a4757}
+  button:active{transform:translateY(1px)}
+  button.primary{background:#173a25;border-color:#256b41;color:#b6f7cd}
+  button.primary:hover{background:#1d4a30}
+  button.danger{background:#3a1a1d;border-color:#6b2529;color:#ffc9cb}
+  button.on{background:#173a25;border-color:#256b41;color:#b6f7cd}
+  select{background:#0e131a;color:var(--fg);border:1px solid #2a3444;border-radius:8px;
+    padding:6px 8px;font-size:12.5px;font-family:inherit;width:100%}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+  .stack{display:flex;flex-direction:column;gap:8px}
+  .hint{font-size:11px;color:var(--dim);margin-top:6px;line-height:1.5}
+  .kv{display:flex;justify-content:space-between;padding:3px 12px;font-size:12px;border-bottom:1px dashed #1a212b}
+  .kv span:first-child{color:var(--dim)}
+  .kv b{font-variant-numeric:tabular-nums;font-weight:600}
+  .ok{color:var(--green)} .warn{color:var(--yellow)} .badc{color:var(--red)} .dimc{color:var(--dim)}
+  #logbox{padding:8px 12px;font:11.5px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;
+    color:#9fb0c2;word-break:break-all}
+  .tabs{display:flex;gap:6px;margin-left:auto}
+  .tabs button{padding:3px 9px;font-size:11px}
+  .tabs button.sel{background:#243044;border-color:#3a4a63;color:#cfe3ff}
+  .toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);background:#16202c;border:1px solid #2a3444;
+    color:var(--fg);padding:9px 16px;border-radius:10px;font-size:13px;opacity:0;transition:.25s;pointer-events:none;z-index:99}
+  .toast.show{opacity:1}
+
+  /* 右下：驾驶员监测（Mac 前置摄像头） */
+  #dmWrap{position:relative;flex:0 0 auto;aspect-ratio:1344/760;background:#000;display:flex}
+  #dmCam{width:100%;height:100%;object-fit:fill;display:block}
+  .dmrows{flex:1 1 auto;min-height:0;overflow:auto;padding-top:4px}
+  #dmBadge{position:absolute;left:8px;top:8px;padding:3px 9px;border-radius:7px;font-size:11.5px;
+    background:rgba(10,14,20,.72);border:1px solid #2a3444}
+
+  /* [C2 补丁 2026-09-27] op 画面可点击 + 点击涟漪 */
+  #opScreen{cursor:pointer;-webkit-user-drag:none;user-select:none;touch-action:none}
+  .ripple{position:absolute;width:26px;height:26px;margin:-13px 0 0 -13px;border-radius:50%;
+    border:2px solid rgba(120,200,255,.95);background:rgba(120,200,255,.22);pointer-events:none;
+    animation:rip .55s ease-out forwards}
+  @keyframes rip{from{transform:scale(.35);opacity:1}to{transform:scale(1.7);opacity:0}}
+
+  /* [模拟方向盘 2026-09-27 重做] 左下状态面板第 3 列：方向盘 + 刹车/油门 */
+  #blStatus{grid-template-columns:1fr 1fr 208px}
+  #driveW{display:flex;align-items:center;justify-content:center;gap:10px;padding:2px 6px}
+  #wheelBox{position:relative;width:116px;height:134px;flex:0 0 auto}
+  #wheelScale,#wheelSvg{position:absolute;left:0;top:0;width:116px;height:116px}
+  #wheelSvg{transition:transform .09s linear}
+  #wheelMark{position:absolute;left:50%;top:-5px;margin-left:-6px;width:0;height:0;z-index:2;
+    border-left:6px solid transparent;border-right:6px solid transparent;border-top:10px solid var(--yellow)}
+  #wheelDeg{position:absolute;left:0;right:0;bottom:0;text-align:center;
+    font:700 13px ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.5px}
+  #wheelDeg.c0{color:#7d8b9c}
+  #wheelDeg.cL{color:#4ea1ff}
+  #wheelDeg.cR{color:#ffa94d}
+  .pedals{display:flex;gap:9px;flex:0 0 auto}
+  .pedal{display:flex;flex-direction:column;align-items:center;gap:4px}
+  .pbar{position:relative;width:34px;height:96px;background:#0e131a;border:1px solid var(--line);
+    border-radius:7px;overflow:hidden}
+  .pfill{position:absolute;left:0;right:0;bottom:0;height:0%;transition:height .1s linear}
+  #brakeFill{background:linear-gradient(180deg,#e5484d,#7a2124)}
+  #gasFill{background:linear-gradient(180deg,#3ee06e,#1d6e39)}
+  .ptxt{position:absolute;left:0;right:0;top:50%;transform:translateY(-50%);text-align:center;
+    font-size:11px;font-weight:700;color:#fff;text-shadow:0 1px 3px rgba(0,0,0,.9);
+    font-variant-numeric:tabular-nums}
+  .plbl{font-size:11px;color:var(--dim)}
+
+  /* [指示器 2026-09-28] TSS 风格简易指示器（车道线实心/空心 · 前车 · 驾驶模式格数） */
+  #indPanel{flex:0 0 auto}
+  #indBody{display:flex;align-items:center;gap:8px;padding:8px 12px}
+  /* [AEB 指示 2026-09-28] 触发碰撞预警/紧急制动时，前车图标变红并闪烁 */
+  #leadCar.aeb rect{fill:#ff453a}
+  #leadCar.aeb{animation:aebBlink .55s linear infinite}
+  @keyframes aebBlink{0%,44%{opacity:1}50%,94%{opacity:.18}100%{opacity:1}}
+  #indLead .aebtxt{color:#ff453a;font-weight:700}
+  @media (prefers-reduced-motion:reduce){#leadCar.aeb{animation:none}}
+  #indSvg{width:168px;height:146px;flex:0 0 auto}
+  #indRows{flex:1 1 auto;min-width:0}
+  .indkv{display:flex;justify-content:space-between;gap:8px;font-size:11.5px;padding:3px 0;
+    border-bottom:1px dashed #1a212b;color:var(--dim)}
+  .indkv:last-child{border-bottom:0}
+  .indkv b{color:var(--fg);font-weight:600;font-variant-numeric:tabular-nums}
+</style>
+</head>
+<body>
+<div id="grid">
+
+  <div class="col colL">
+    <!-- ===== 左上：op 原版主机画面（直接来自 op UI 进程的渲染输出） ===== -->
+    <div class="panel" id="opPanel">
+      <div class="phead">
+        <span class="dot" id="dotCam"></span><b id="opTitle">openpilot 主机画面（原版）</b>
+        <span class="dimc" id="camInfo"></span>
+        <span class="dimc" style="margin-left:auto" id="opHint">op 原生界面 · 实时 · 点击可操作</span>
+      </div>
+      <div id="viewWrap">
+        <img id="opScreen" src="/api/opstream" alt="openpilot 主机画面" draggable="false">
+        <div id="starting"><div>openpilot 正在启动…</div><div class="sub">首次启动约 40 秒（加载模型 + 初始化）<br>画面出现车道线后本提示自动消失</div></div>
+        <div id="alert"></div>
+      </div>
+    </div>
+
+    <!-- ===== 左下：状态/指标 + 日志（分页切换） ===== -->
+    <div class="panel" id="statusPanel">
+      <div class="phead">
+        <span class="dot" id="dotData"></span><b id="blTitle">状态 / 指标</b>
+        <span class="dimc" id="updT"></span>
+        <span class="tabs">
+          <button class="sel" data-bl="status">状态/指标</button>
+          <button data-bl="log">日志</button>
+        </span>
+      </div>
+      <div class="pbody grid2" id="blStatus" style="padding:6px 0">
+        <div>
+          <div class="kv"><span>车速</span><b id="sVego">-</b></div>
+          <div class="kv"><span>指令加速度</span><b id="sAccel">-</b></div>
+          <div class="kv"><span>方向盘角度</span><b id="sSteer">-</b></div>
+          <div class="kv"><span>接管状态</span><b id="sEngage">-</b></div>
+          <div class="kv"><span>车型</span><b id="sCar">-</b></div>
+          <div class="kv"><span>车道线置信度</span><b id="sLanes">-</b></div>
+          <div class="kv"><span>车道内偏移</span><b id="sLaneOff">-</b></div>
+        </div>
+        <div>
+          <div class="kv"><span>纵向控制</span><b id="sLong">-</b></div>
+          <div class="kv"><span>前车距离（模型估算）</span><b id="sLeadD">-</b></div>
+          <div class="kv"><span>前车相对速度</span><b id="sLeadV">-</b></div>
+          <div class="kv"><span>模型前车概率</span><b id="sLeadP">-</b></div>
+          <div class="kv"><span>巡航设定</span><b id="sCruise">-</b></div>
+          <div class="kv"><span>模型 / 相机</span><b id="sHz">-</b></div>
+        </div>
+        <!-- [模拟方向盘 2026-09-27 重做] 真车样式：轮缘 + T 形三辐条 + 气囊盖 + 12点红色标记；固定刻度盘 + 顶部黄指针 -->
+        <div id="driveW">
+          <div id="wheelBox">
+            <svg id="wheelScale" viewBox="0 0 120 120" aria-hidden="true"><g id="scaleTicks"></g><path id="scaleArc" fill="none" stroke="#4ea1ff" stroke-width="3" stroke-linecap="round" opacity="0"/></svg>
+            <svg id="wheelSvg" viewBox="0 0 120 120">
+              <defs>
+                <radialGradient id="rimG" cx="38%" cy="28%" r="82%">
+                  <stop offset="0%" stop-color="#66788e"/>
+                  <stop offset="55%" stop-color="#384555"/>
+                  <stop offset="100%" stop-color="#1a222c"/>
+                </radialGradient>
+                <linearGradient id="hubG" x1="0" y1="0" x2="0" y2="1">
+                  <stop offset="0%" stop-color="#4a5663"/>
+                  <stop offset="100%" stop-color="#232b35"/>
+                </linearGradient>
+              </defs>
+              <!-- 轮缘：深色底 + 渐变主体（像真方向盘的粗细与明暗） -->
+              <circle cx="60" cy="60" r="44" fill="none" stroke="#0e141b" stroke-width="14"/>
+              <circle cx="60" cy="60" r="44" fill="none" stroke="url(#rimG)" stroke-width="11.5"/>
+              <!-- 12 点方向红色标记（随轮转动 → 方向一眼可见） -->
+              <rect x="54.5" y="13.5" width="11" height="7.5" rx="3.2" fill="#e5484d"/>
+              <!-- 三根辐条：左 / 右 / 下（真车 T 形布局） -->
+              <g fill="url(#hubG)" stroke="#0e141b" stroke-width="1.2">
+                <rect x="14" y="55.5" width="38" height="9" rx="4.5"/>
+                <rect x="68" y="55.5" width="38" height="9" rx="4.5"/>
+                <rect x="55.5" y="68" width="9" height="34" rx="4.5"/>
+              </g>
+              <!-- 中心气囊盖 -->
+              <ellipse cx="60" cy="60" rx="23" ry="18" fill="url(#hubG)" stroke="#0d1218" stroke-width="1.5"/>
+              <ellipse cx="60" cy="56" rx="16.5" ry="10.5" fill="#2c3540" opacity=".9"/>
+            </svg>
+            <div id="wheelMark"></div>
+            <div id="wheelDeg">-</div>
+          </div>
+          <div class="pedals">
+            <div class="pedal">
+              <div class="pbar"><div class="pfill" id="brakeFill"></div><span class="ptxt" id="brakeTxt">0%</span></div>
+              <div class="plbl">刹车</div>
+            </div>
+            <div class="pedal">
+              <div class="pbar"><div class="pfill" id="gasFill"></div><span class="ptxt" id="gasTxt">0%</span></div>
+              <div class="plbl">油门</div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="pbody" id="blLog" style="display:none">
+        <div class="tabs" style="padding:6px 10px 0;margin-left:0">
+          <button class="sel" data-log="stack">运行</button>
+          <button data-log="manager">管理器</button>
+          <button data-log="bridge">假车</button>
+          <button data-log="launcher">启动器</button>
+        </div>
+        <div id="logbox">加载中…</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="col colR">
+    <!-- ===== 右上：驾驶指示器（TSS 风格：车道线 / 前车 / 驾驶模式） ===== -->
+    <div class="panel" id="indPanel">
+      <div class="phead"><span class="dot" id="dotInd"></span><b>驾驶指示器</b>
+        <span class="dimc" id="indMode" style="margin-left:auto">-</span></div>
+      <div id="indBody">
+        <svg id="indSvg" viewBox="0 0 260 210" aria-label="驾驶指示器">
+          <!-- 车道线：实心 = 识别到，空心（虚线描边）= 未识别到 -->
+          <polygon id="laneLShape" points="100,26 91,26 28,196 40,196" fill="none" stroke="#3a4656" stroke-width="1.6" stroke-dasharray="5 4"/>
+          <polygon id="laneRShape" points="160,26 169,26 232,196 220,196" fill="none" stroke="#3a4656" stroke-width="1.6" stroke-dasharray="5 4"/>
+          <!-- 前车（车屁股）：有前车才显示 -->
+          <g id="leadCar" style="display:none">
+            <rect x="110" y="26" width="40" height="27" rx="7" fill="#c9d7e9"/>
+            <rect x="117" y="30" width="26" height="9" rx="3" fill="#243044"/>
+            <rect x="112" y="43" width="7" height="4" rx="2" fill="#e5484d"/>
+            <rect x="141" y="43" width="7" height="4" rx="2" fill="#e5484d"/>
+            <rect x="112" y="50" width="7" height="5" rx="2" fill="#5a6b80"/>
+            <rect x="141" y="50" width="7" height="5" rx="2" fill="#5a6b80"/>
+          </g>
+          <!-- 驾驶模式：三条横杠，亮起 1/2/3 格 -->
+          <rect id="bar3" x="92" y="112" width="76" height="10" rx="5" fill="#1a2230" stroke="#2a3444" stroke-width="1"/>
+          <rect id="bar2" x="86" y="134" width="88" height="10" rx="5" fill="#1a2230" stroke="#2a3444" stroke-width="1"/>
+          <rect id="bar1" x="80" y="156" width="100" height="10" rx="5" fill="#1a2230" stroke="#2a3444" stroke-width="1"/>
+        </svg>
+        <div id="indRows">
+          <div class="indkv"><span>前车</span><b id="indLead">-</b></div>
+          <div class="indkv"><span>左车道线</span><b id="indL">-</b></div>
+          <div class="indkv"><span>右车道线</span><b id="indR">-</b></div>
+          <div class="indkv"><span>驾驶模式</span><b id="indModeBars">-</b></div>
+        </div>
+      </div>
+    </div>
+    <!-- ===== 右上：控制台 ===== -->
+    <div class="panel" id="ctrlPanel">
+      <div class="phead"><span class="dot" id="dotStack"></span><b>控制台</b><span id="stackInfo" class="dimc"></span></div>
+      <div class="pbody">
+        <div class="row">
+          <div class="lbl">视频</div>
+          <div class="grid2">
+            <button class="primary" id="btnImport">📁 导入视频…</button>
+            <button class="danger" id="btnStop">⏹ 停止</button>
+          </div>
+          <!-- [恢复到主页 2026-09-30] 一键：切出当前推理 → 退回 op 主页 -->
+          <button id="btnHome" style="width:100%;margin-top:8px">🏠 恢复到主页</button>
+        </div>
+        <div class="row">
+          <div class="lbl">播放控制</div>
+          <div class="grid2">
+            <button id="btnPause">⏸ 暂停</button>
+            <button id="btnSpeed">⏩ 1.0x</button>
+          </div>
+          <div class="grid2" style="margin-top:8px">
+            <button id="btnRestart">⏮ 重播</button>
+            <button class="danger" id="btnQuit">⏻ 退出全部</button>
+          </div>
+          <div class="hint">暂停/倍速/重播直接作用于播放管线（不重启全栈）；「退出全部」= 停 op + 关闭控制台。</div>
+        </div>
+        <!-- [重新校准 2026-09-29] op 的相机标定：演示默认预置了一个「假的有效标定」，
+             这里可以清掉它让 op 真校准（op 只在车速>24km/h 直线行驶时才采数据）。 -->
+        <div class="row">
+          <div class="lbl">相机标定</div>
+          <div class="grid2">
+            <button id="btnRecalib">🎯 重新校准</button>
+            <button id="btnRestoreCalib">↩ 恢复预置标定</button>
+          </div>
+          <div class="hint" id="calibInfo">标定：—</div>
+          <div class="hint">「重新校准」= 清掉预置的假标定，让 op 从零开始真校准：op 只在 <b>&gt;24km/h、直线、低偏航</b> 时才采校准块（放 30km/h 以上的素材才收敛）。校准期间画面会先歪，收敛后回正；「恢复预置标定」= 立刻回到已校准状态。</div>
+        </div>
+        <!-- [slowroads 自动驾驶开关 2026-09-29] op 开 slowroads 的总开关：
+             开 = 启动控制桥（op 的 carControl → 虚拟手柄 → 游戏），关 = 立刻还给你。 -->
+        <div class="row">
+          <div class="lbl">slowroads 自动驾驶</div>
+          <div class="grid2">
+            <button class="primary" id="btnGameDrive">▶ 开始 slowroads 自动驾驶</button>
+            <button id="btnSRReconnect" style="display:none">🔄 重新接入</button>
+          </div>
+          <div class="hint" id="gameInfo">未启动</div>
+          <div class="hint">点「开始」= op 通过<b>虚拟手柄</b>接管游戏的方向盘/油门/刹车（全程不碰你的鼠标）；再点一次 = 停止、立刻还给你。前提：画面源是 slowroads 实时画面、游戏窗口开着。</div>
+        </div>
+        <div class="row">
+          <div class="lbl">测试素材（4 组 × 8 速度档）</div>
+          <div class="stack">
+            <select id="selGroup"></select>
+            <select id="selFile"></select>
+            <button class="primary" id="btnPlaySel">▶ 播放此素材</button>
+          </div>
+        </div>
+        <div class="row">
+          <div class="lbl">导出</div>
+          <div class="grid2">
+            <button id="btnShot">🖼 保存主机画面</button>
+            <button id="btnData">📊 模型数据</button>
+          </div>
+        </div>
+        <div class="row">
+          <div class="lbl">纵向控制（ACC 接管）</div>
+          <button id="btnLong" style="width:100%">● 未接管</button>
+          <div class="hint">开启后：模拟按巡航键接管，车速跟随模型的加减速指令；关闭会发 CANCEL 解除。</div>
+        </div>
+        <div class="row">
+          <div class="lbl">性能提示（延迟报警）</div>
+          <button id="btnPerf" style="width:100%">○ 已关闭</button>
+          <div class="hint">op 的「TAKE CONTROL / System Lagging」报警——离线 demo 里没有真车，它是误报。开启后会显示提示并发出警报声。</div>
+        </div>
+        <div class="row">
+          <div class="lbl">推理引擎（模型跑在哪）</div>
+          <div class="grid2">
+            <button id="btnAne">🧠 ANE 神经引擎</button>
+            <button id="btnMetal">⚙ Metal（tinygrad）</button>
+          </div>
+          <div class="hint">ANE = Apple 神经引擎，modeld 占用约 <b>15.7%</b>、推理 4.4ms；Metal = 原来的 tinygrad 路径，约 <b>38%</b>、13.6ms。切换会<b>自动重启演示</b>（约 40 秒）后生效。</div>
+        </div>
+        <div class="row">
+          <div class="lbl">推理帧率（模型每秒推理几次）</div>
+          <div class="grid4">
+            <button id="btnFps5">5 fps</button>
+            <button id="btnFps10">10 fps</button>
+            <button id="btnFps15">15 fps</button>
+            <button id="btnFps20">20 fps</button>
+          </div>
+          <div class="hint">当前：<b id="rFps">-</b> · 改完<b>立即生效</b>（不用重启）。帧率越低越省电/越不卡；20 = 原速（模型训练帧率）。</div>
+        </div>
+        <div class="row">
+          <div class="lbl">运行状态</div>
+          <div class="kv"><span>接管</span><b id="rEng">-</b></div>
+          <div class="kv"><span>推理引擎（当前）</span><b id="rBackend">-</b></div>
+          <div class="kv"><span>模型频率</span><b id="rMhz">-</b></div>
+          <div class="kv"><span>相机频率</span><b id="rChz">-</b></div>
+          <div class="kv"><span>帧号</span><b id="rFrame">-</b></div>
+          <div class="kv"><span>系统负载</span><b id="rLoad">-</b></div>
+          <div class="kv"><span>内存</span><b id="rMem">-</b></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- 右下：驾驶员监测功能已按要求移除（2026-09-27）。若日后要恢复，见 git 历史。 -->
+    </div>
+  </div>
+
+</div>
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+let last = {snap:null, ts:0, hz:{m:[], c:[]}, logName:'stack', bl:'status', view:'', stream:''};
+
+function toast(msg, ms=2600){
+  const t = $('#toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(t._h); t._h = setTimeout(()=>t.classList.remove('show'), ms);
+}
+async function post(path, body){
+  const r = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'},
+                               body: JSON.stringify(body||{})});
+  return r.json();
+}
+const f1 = x => (isFinite(x) ? x.toFixed(1) : '-');
+const pct = x => (x === null || x === undefined || !isFinite(x)) ? '-' : (x*100).toFixed(0) + '%';
+
+/* ---------- 主面板更新 ---------- */
+function update(snap){
+  const d = snap && snap.data || {};
+  const p = snap && snap.procs || {};
+  last.snap = snap;
+
+  const now = performance.now();
+  if (last.ts){
+    const dt = (now - last.ts)/1000;
+    if (d.modelV2) last.hz.m.push(1/dt), last.hz.m = last.hz.m.slice(-20);
+    if (d.camera)  last.hz.c.push(1/dt), last.hz.c = last.hz.c.slice(-20);
+  }
+  last.ts = now;
+  const avg = a => a.length ? (a.reduce((x,y)=>x+y,0)/a.length) : 0;
+  // [帧率修复 2026-09-27] 优先用服务端按 frameId 差分的真实帧率（前端 SSE 推送率会显示成 ~5Hz）
+  const rr = d.rates || {};
+  const hzM = (rr.model !== undefined) ? rr.model : avg(last.hz.m);
+  const hzC = (rr.camera !== undefined) ? rr.camera : avg(last.hz.c);
+
+  const running = !!p.running;
+  $('#dotStack').className = 'dot ' + (running ? 'on' : 'bad');
+  $('#stackInfo').textContent = running ? `${p.count} 进程` : '未运行';
+  // [slowroads App 自动接入 + 主页默认 2026-09-30] 左上角画面源自动切换（只在变化时切，防闪断）：
+  //   slowroads App 开着（且不在主页模式）→ 游戏实时画面；否则 → op 原生画面（主页/行车）
+  const srApp = d.slowroads || {};
+  const home = !!d.home;
+  const wantView = (srApp.open && !home) ? 'sr' : 'op';
+  // 画面流只在 sr/op 之间切换时重挂（避免 home 变化导致流重连闪断）
+  if (wantView !== last.stream){
+    last.stream = wantView;
+    const img = $('#opScreen');
+    if (img) img.src = (wantView === 'sr') ? '/api/gamestream' : '/api/opstream';
+  }
+  // 标题/提示（home 变化也要更新）
+  const viewKey = wantView + (home ? '+home' : '');
+  if (viewKey !== last.view){
+    last.view = viewKey;
+    const t = $('#opTitle');
+    if (t) t.textContent = (wantView === 'sr') ? 'slowroads 实时画面（游戏原画）'
+      : (home ? 'openpilot 主页' : 'openpilot 主机画面（原版）');
+    const h = $('#opHint');
+    if (h) h.textContent = (wantView === 'sr') ? '游戏实时画面 · 只读（不是 op 处理画面）'
+      : 'op 原生界面 · 实时 · 点击可操作';
+  }
+  $('#dotCam').className = 'dot ' + (wantView === 'sr' ? (srApp.open ? 'on' : 'bad') : (d.camera ? 'on' : (running ? '' : 'bad')));
+  $('#dotData').className = 'dot ' + (d.modelV2 ? 'on' : 'bad');
+  $('#updT').textContent = new Date().toLocaleTimeString('zh-CN', {hour12:false});
+  // [B5 修复 2026-09-27] 启动浮层：栈在跑、但模型还没出数据 → 显示「正在启动…」
+  $('#starting').classList.toggle('hide', !(running && !d.modelV2));
+
+  const cs = d.carState, ss = d.selfdriveState, mv = d.modelV2, rs = d.radarState,
+        cc = d.carControl, cp = d.carParams;
+  const eng = !!(ss && (ss.enabled || ss.active));
+
+  // [播完标记 2026-09-28] 视频定格后相机仍按 20 帧/秒重发最后一帧，frameId 会一直涨 →
+  // 看起来像「还在播」。用相机写的 ended.flag（服务端 video_ended）把「帧 N」换成「已播完」。
+  // [画面冻结提示 2026-09-29] 画面源冻结（游戏窗口被切到后台/暂停）时明说，否则用户以为模型坏了
+  const stallHint = (d.camStalled && !d.video_ended)
+    ? ' ｜ <span class="warn">画面源已冻结（游戏窗口被切到后台？切回去就恢复）</span>' : '';
+  // [slowroads App 自动接入 + 主页默认 2026-09-30] 状态行按当前画面源切换
+  const homeHint = home ? ' ｜ <span class="dimc">主页模式（未在推理）</span>' : '';
+  if (wantView === 'sr'){
+    $('#camInfo').innerHTML = srApp.connected
+      ? `已接入 openpilot（实时源）｜ 模型 ${f1(hzM)}Hz ｜ 相机 ${f1(hzC)}Hz` + stallHint
+      : '<span class="warn">正在接入 openpilot…（约 1 分钟，游戏画面先看）</span>';
+  } else {
+    $('#camInfo').innerHTML = d.camera
+      ? ((d.video_ended ? `已播完（定格最后一帧）｜ 模型 ${f1(hzM)}Hz ｜ 相机 ${f1(hzC)}Hz`
+                        : `帧 ${d.camera.frameId} ｜ 模型 ${f1(hzM)}Hz ｜ 相机 ${f1(hzC)}Hz`) + stallHint + homeHint)
+      : (home ? '<span class="dimc">主页模式（未在推理）</span>' : '');
+  }
+
+  $('#rEng').innerHTML = ss ? (eng ? '<span class="ok">已接管</span>'
+    : (ss.engageable ? '<span class="warn">可接管</span>' : '<span class="dimc">未接管</span>')) : '-';
+  $('#rMhz').textContent = f1(hzM) + ' Hz';
+  $('#rChz').textContent = f1(hzC) + ' Hz';
+  $('#rFrame').textContent = mv ? (d.video_ended ? '已播完' : mv.frameId) : '-';
+
+  $('#sVego').textContent = cs ? `${cs.vEgo.toFixed(1)} m/s (${(cs.vEgo*3.6).toFixed(0)} km/h)` : '-';
+  $('#sAccel').textContent = cc ? `${cc.accel>=0?'+':''}${cc.accel.toFixed(2)} m/s²` : '-';
+  $('#sSteer').textContent = cs ? `${cs.steeringAngleDeg.toFixed(1)}°` : '-';
+  $('#sEngage').innerHTML = ss ? (eng ? '<span class="ok">已接管</span>'
+    : (ss.engageable ? '<span class="warn">可接管</span>' : '<span class="dimc">未接管</span>')) : '-';
+  $('#sCar').textContent = cp && cp.fingerprint ? cp.fingerprint : '-';
+  $('#sLong').innerHTML = cp ? (cp.openpilotLongitudinalControl ? '<span class="ok">开（op 纵向）</span>' : '<span class="dimc">关</span>') : '-';
+  // [死行修复 2026-09-27] 原来显示「4 / 33」是模型规格常量，永远不变 → 换成实时数据：
+  //   车道线置信度 = 模型对 4 条线（左左/左/右/右右）的把握（画面差/遮挡时会掉下来）
+  //   车道线最远   = 模型当前能追到多远的车道线（米），直接反映「看得多远」
+  if (mv && mv.laneLineProbs && mv.laneLineProbs.length){
+    $('#sLanes').textContent = mv.laneLineProbs.map(v => Number(v).toFixed(2)).join(' / ');
+  } else { $('#sLanes').textContent = '-'; }
+  // 车道内偏移：左右车道线在「车头处」的横向中点 → 车在车道里偏左还是偏右（实时变化）
+  if (mv && mv.laneLines && mv.laneLines.length >= 3){
+    const yAt0 = (l) => {
+      if (!l.x || !l.y || !l.x.length) return null;
+      let j = 0; for (let k = 1; k < l.x.length; k++) if (Math.abs(l.x[k]) < Math.abs(l.x[j])) j = k;
+      return l.y[j];
+    };
+    const a = yAt0(mv.laneLines[1]), b = yAt0(mv.laneLines[2]);
+    const pA = (mv.laneLineProbs || [])[1], pB = (mv.laneLineProbs || [])[2];
+    if (a !== null && b !== null && pA > 0.3 && pB > 0.3){
+      const off = (a + b) / 2;   // + = 车道中心在车左侧 → 车偏右
+      const side = Math.abs(off) < 0.15 ? '居中' : (off > 0 ? '偏右' : '偏左');
+      $('#sLaneOff').textContent = `${side} ${Math.abs(off).toFixed(2)} m`;
+    } else { $('#sLaneOff').textContent = '车道线不足'; }
+  } else { $('#sLaneOff').textContent = '-'; }
+  $('#sHz').textContent = `${f1(hzM)} / ${f1(hzC)} Hz`;
+
+  const lo = rs && rs.leadOne;
+  const lv3 = (mv && mv.leadsV3 && mv.leadsV3[0]) ? mv.leadsV3[0] : null;
+  const prob = lv3 ? lv3.prob : null;
+  // [B1 修复 2026-09-27] 用 op 自己的采纳标志 present（= radard 真的采用了这条前车）；
+  // 未采纳时显示「模型看到的距离」，并按 op 的真实门槛 0.5 标注，避免误读。
+  const adopted = !!(lo && lo.present);
+  $('#sLeadD').textContent = adopted ? `${lo.dRel.toFixed(1)} m`
+    : (lv3 && prob > 0.1 ? `未采纳（模型看到 ${lv3.x[0].toFixed(0)} m）` : '-');
+  $('#sLeadV').textContent = adopted ? `${lo.vRel>=0?'+':''}${lo.vRel.toFixed(1)} m/s` : '-';
+  $('#sLeadP').innerHTML = prob === null ? '-'
+    : (prob > 0.5 ? `<span class="ok">${prob.toFixed(2)} ✓ op 已采纳</span>` : `<span class="dimc">${prob.toFixed(2)} · 未达 0.5</span>`);
+  $('#sCruise').textContent = cs && cs.cruise ? `${cs.cruise.enabled?'开':'关'}${cs.cruise.speed?(' / '+(cs.cruise.speed*3.6).toFixed(0)+' km/h'):''}` : '-';
+
+  const longOn = d.demoLong === true;
+  $('#btnLong').className = longOn ? 'on' : '';
+  $('#btnLong').textContent = longOn ? '● 已开启（纵向接管中）' : '● 未接管（点此开启）';
+
+  const perfOn = d.perfAlert === true;
+  $('#btnPerf').className = perfOn ? 'on' : '';
+  $('#btnPerf').textContent = perfOn ? '● 已开启（延迟时报警）' : '○ 已关闭（不报警）';
+
+  // [推理后端设置 2026-09-28] 按钮显示「控制台里选的」，运行状态显示「当前实际在跑的」
+  const mb = d.modelBackend || {};
+  const curBe = mb.running || null, setBe = mb.setting || 'coreml';
+  $('#btnAne').className = (setBe === 'coreml') ? 'on' : '';
+  $('#btnMetal').className = (setBe === 'tinygrad') ? 'on' : '';
+  $('#rBackend').innerHTML = curBe === 'coreml' ? '<span class="ok">🧠 ANE 神经引擎</span>'
+    : (curBe === 'tinygrad' ? '⚙ Metal（tinygrad）' : '<span class="dimc">未运行</span>');
+
+  // [推理帧率设置 2026-09-29] 帧率档位按钮高亮 + 当前显示
+  const fpsd = d.inferFps || {};
+  const curFps = Number(fpsd.setting || 0);
+  [5,10,15,20].forEach(v => { $('#btnFps'+v).className = (curFps === v) ? 'on' : ''; });
+  $('#rFps').textContent = curFps ? (curFps + ' fps' + (fpsd.model ? '（模型实际 ' + fpsd.model + ' Hz）' : '')) : '-';
+
+  // [指示器 2026-09-28] TSS 风格简易指示器：车道线实心/空心 · 前车 · 驾驶模式格数
+  const ind = d.indicator || {};
+  const LANE_ON = 0.5;      // 「识别到车道线」的置信度阈值（与 op 采纳标准一致）
+  const setLane = (el, prob) => {
+    const on = Number(prob || 0) >= LANE_ON;
+    el.setAttribute('fill', on ? '#e6edf3' : 'none');
+    el.setAttribute('stroke', on ? '#e6edf3' : '#3a4656');
+    el.setAttribute('stroke-width', on ? '1.2' : '1.6');
+    el.setAttribute('stroke-dasharray', on ? '' : '5 4');
+    return on;
+  };
+  const onL = setLane($('#laneLShape'), ind.laneL);
+  const onR = setLane($('#laneRShape'), ind.laneR);
+  // [AEB 指示 2026-09-28] AEB 触发时前车强制显示、变红并闪烁（CSS 动画）
+  const aebOn = !!ind.aeb;
+  $('#leadCar').style.display = (ind.lead || aebOn) ? '' : 'none';
+  $('#leadCar').classList.toggle('aeb', aebOn);
+  const mBars = Number(ind.bars || 0);
+  [['#bar1', 1], ['#bar2', 2], ['#bar3', 3]].forEach(([sel, i]) => {
+    const el = $(sel), on = i <= mBars;
+    el.setAttribute('fill', on ? '#3ee06e' : '#1a2230');
+    el.setAttribute('stroke', on ? '#3ee06e' : '#2a3444');
+  });
+  const MODE_CN = {aggressive: 'Aggressive 激进', standard: 'Standard 标准', relaxed: 'Relaxed 放松'};
+  const modeTxt = (MODE_CN[ind.mode] || '-') + (mBars ? ` · ${mBars} 格` : '');
+  $('#indLead').innerHTML = aebOn
+    ? `<span class="aebtxt">⚠ AEB 紧急制动${ind.leadDist != null ? ' · ' + Number(ind.leadDist).toFixed(1) + ' m' : ''}</span>`
+    : (ind.lead
+       ? `<span class="ok">有前车${ind.leadDist != null ? ' · ' + Number(ind.leadDist).toFixed(1) + ' m' : ''}</span>` : '无前车');
+  $('#indL').innerHTML = onL ? `<span class="ok">实心 · ${Number(ind.laneL).toFixed(2)}</span>` : `<span class="dimc">空心 · ${Number(ind.laneL).toFixed(2)}</span>`;
+  $('#indR').innerHTML = onR ? `<span class="ok">实心 · ${Number(ind.laneR).toFixed(2)}</span>` : `<span class="dimc">空心 · ${Number(ind.laneR).toFixed(2)}</span>`;
+  $('#indModeBars').textContent = modeTxt;
+  $('#indMode').textContent = modeTxt;
+  $('#dotInd').className = 'dot' + (d.seen && d.seen.modelV2 ? ' on' : '');
+
+  // [模拟方向盘 2026-09-27] 方向盘图标按「实际转角 × 转向比」旋转；刹车/油门按百分比柱显示
+  const sr = (cp && cp.steerRatio) ? cp.steerRatio : 15.9;
+  // [方向盘修正 2026-09-27 晚·实测版] carState.steeringAngleDeg 已经是「方向盘角」本身
+  //   （VehicleModel 反算时含转向比，不要再乘）。符号以实车观察为准：**正 = 左 / 负 = 右**，
+  //   所以画面旋转要 rotate(-deg)（CSS 正角=顺时针），左转配蓝、右转配橙。
+  const deg = cs ? cs.steeringAngleDeg : 0;              // 真·方向盘角度
+  const leftDeg = deg;                                   // 左正（实测：正 = 左）
+  const wheelDeg = Math.max(-540, Math.min(540, deg));   // 真车锁止约 ±540°
+  $('#wheelSvg').style.transform = `rotate(${(-wheelDeg).toFixed(1)}deg)`;  // 左(正) → 逆时针
+  // 刻度盘上的彩色角度弧（画到 ±180 为止）：蓝 = 左、橙 = 右，方向一眼可见
+  const arcEl = $('#scaleArc'), aw = Math.abs(deg);
+  if (cs && aw >= 1.5){
+    const r = 53.5, lim = Math.max(-180, Math.min(180, leftDeg));
+    const rad = lim * Math.PI / 180;
+    const x1 = 60 - r * Math.sin(rad), y1 = 60 - r * Math.cos(rad);
+    arcEl.setAttribute('d', `M 60 ${(60 - r).toFixed(1)} A ${r} ${r} 0 0 ${lim > 0 ? 0 : 1} ${x1.toFixed(1)} ${y1.toFixed(1)}`);
+    arcEl.setAttribute('stroke', leftDeg > 0 ? '#4ea1ff' : '#ffa94d');
+    arcEl.setAttribute('opacity', '.92');
+  } else { arcEl.setAttribute('opacity', '0'); }
+  const wEl = $('#wheelDeg');
+  if (!cs){ wEl.textContent = '-'; wEl.className = 'c0'; }
+  else if (aw < 1.5){ wEl.textContent = '居中'; wEl.className = 'c0'; }
+  else { wEl.textContent = `${leftDeg > 0 ? '左' : '右'} ${aw.toFixed(0)}°`; wEl.className = leftDeg > 0 ? 'cL' : 'cR'; }
+  let brakePct = cc ? Math.max(0, Math.min(1, cc.brake)) * 100 : 0;
+  let gasPct = cc ? Math.max(0, Math.min(1, cc.gas)) * 100 : 0;
+  // op 的 gas/brake 就是「加速度指令 → 踏板」的投射；两者都为 0 时用加速度兜底
+  if (cc && brakePct < 0.5 && gasPct < 0.5 && Math.abs(cc.accel) > 0.15){
+    if (cc.accel > 0) gasPct = Math.min(1, cc.accel / 2.0) * 100;
+    else brakePct = Math.min(1, -cc.accel / 3.5) * 100;
+  }
+  $('#brakeFill').style.height = brakePct.toFixed(0) + '%';
+  $('#gasFill').style.height = gasPct.toFixed(0) + '%';
+  $('#brakeTxt').textContent = brakePct.toFixed(0) + '%';
+  $('#gasTxt').textContent = gasPct.toFixed(0) + '%';
+
+  // [C1 补丁 2026-09-27] 播放控制按钮状态 + 系统负载
+  const pb2 = d.playback || {};
+  const paused = pb2.pause === true;
+  $('#btnPause').textContent = paused ? '▶ 继续' : '⏸ 暂停';
+  $('#btnPause').className = paused ? 'on' : '';
+  const spd = (pb2.speed !== undefined) ? Number(pb2.speed) : 1;
+  $('#btnSpeed').textContent = '⏩ ' + spd.toFixed(1) + 'x';
+  $('#btnSpeed').className = (spd !== 1) ? 'on' : '';
+  const sy = d.sys;
+  $('#rLoad').textContent = sy ? `${sy.load1.toFixed(1)} / ${sy.load5.toFixed(1)}（${sy.ncpu} 核）` : '-';
+  $('#rMem').textContent = (sy && sy.mem_total_gb) ? `${sy.mem_used_gb.toFixed(1)} / ${sy.mem_total_gb.toFixed(0)} GB` : '-';
+
+  // [重新校准 2026-09-29] 标定状态显示
+  const cb = d.calib;
+  if (cb){
+    const ci = $('#calibInfo');
+    if (ci){
+      if (cb.status === 'calibrated'){
+        ci.textContent = '标定：已校准 ✓（' + (cb.validBlocks|0) + ' 块）';
+        ci.style.color = '#8ce99a';
+      } else if (cb.status === 'calibrating'){
+        ci.textContent = '标定：校准中 ' + (cb.perc|0) + '%（需要 >24km/h 直线行驶）';
+        ci.style.color = '#ffd479';
+      } else {
+        ci.textContent = '标定：未校准（需要 >24km/h 直线行驶）';
+        ci.style.color = '#ffd479';
+      }
+    }
+  }
+
+  // [slowroads 自动驾驶开关 2026-09-29] 控制桥状态 + 实时手柄值
+  const g = d.game;
+  if (g){
+    const gb = $('#btnGameDrive');
+    if (gb){
+      const grun = !!g.running;
+      gb.textContent = grun ? '⏹ 停止 slowroads 自动驾驶' : '▶ 开始 slowroads 自动驾驶';
+      gb.className = grun ? 'danger' : 'primary';
+    }
+    const gi = $('#gameInfo');
+    if (gi){
+      if (g.running){
+        const sd = (g.steer >= 0 ? '+' : '') + (g.steer * 90).toFixed(0);
+        gi.textContent = `op 正在驾驶 slowroads：方向盘 ${sd}° · 油门 ${(g.throttle*100).toFixed(0)}% · 刹车 ${(g.brake*100).toFixed(0)}%`;
+        gi.style.color = '#8ce99a';
+      } else {
+        if (srApp.open && !srApp.connected){
+          gi.textContent = '未启动（slowroads 开着，op 还没接入 —— 点「🔄 重新接入」）';
+        } else if (!srApp.open){
+          gi.textContent = '未启动（先打开「openpilot slowroads」App）';
+        } else {
+          gi.textContent = '未启动（画面源已就绪 ✓）';
+        }
+        gi.style.color = '';
+      }
+    }
+    // [slowroads App 自动接入 2026-09-30] 「重新接入」按钮：App 开着但还没接入时显示
+    const rb = $('#btnSRReconnect');
+    if (rb) rb.style.display = (srApp.open && !srApp.connected) ? '' : 'none';
+  }
+
+  const al = $('#alert');
+  if (ss && (ss.alertText1 || ss.alertText2)){
+    al.className = 'show';
+    al.textContent = [ss.alertText1, ss.alertText2].filter(Boolean).join(' · ');
+  } else al.className = '';
+
+  updateDM(d.driver, snap.t);
+}
+
+/* ---------- 驾驶员监测：功能已移除（2026-09-27），保留空函数避免调用点报错 ---------- */
+function updateDM(dm, t){
+  return;
+  const fresh = dm && dm.ts && t && (t - dm.ts) < 3.0;
+  const camOk = !!(dm && dm.cam && fresh);
+  // DM 数据自己的新鲜度：进程死了以后绝不能再拿冻住的旧值冒充"正常"
+  const dmFresh = !!(dm && dm.dmTs && t && (t - dm.dmTs) < 3.0);
+  // 只有拿到 op 注意力模型的真实输出才算"有检测数据"，否则绝不显示"正常"
+  const hasDM = !!(dmFresh && ((dm.face !== null && dm.face !== undefined) ||
+                               (dm.faceDetected !== null && dm.faceDetected !== undefined)));
+
+  $('#dotDM').className = 'dot ' + (!camOk ? 'bad' : (hasDM ? (dm.distracted ? 'warn' : 'on') : 'warn'));
+  $('#dmInfo').textContent = camOk ? `${f1(dm.fps)} fps` : (dm && dm.error ? '错误' : '无数据');
+
+  $('#dmFace').textContent = (dmFresh && dm.face !== null && dm.face !== undefined) ? pct(dm.face) : '-';
+  $('#dmEyes').textContent = (dmFresh && dm.leftEye !== null && dm.leftEye !== undefined)
+    ? `${pct(dm.leftEye)} / ${pct(dm.rightEye)}` : '-';
+  $('#dmSleep').textContent = (dmFresh && dm.sleep !== null && dm.sleep !== undefined)
+    ? `${pct(dm.sleep)} / ${pct(dm.phone)}` : '-';
+  $('#dmAtt').innerHTML = (dmFresh && dm.awareness !== null && dm.awareness !== undefined)
+    ? ((dm.awareness >= 70 ? '<span class="ok">' : (dm.awareness >= 35 ? '<span class="warn">' : '<span class="badc">'))
+       + dm.awareness.toFixed(0) + '%</span>') : '-';
+  $('#dmTypes').textContent = (dmFresh && Array.isArray(dm.distTypes))
+    ? (dm.distTypes.length ? dm.distTypes.join(' / ') : '无') : '-';
+
+  const badge = $('#dmBadge');
+  let txt, cls;
+  if (!dm || !dm.ts)            { txt = '未启动'; cls = 'dimc'; }
+  else if (!fresh)              { txt = '摄像头无数据'; cls = 'badc'; }
+  else if (!hasDM)              { txt = 'op 注意力模型未运行'; cls = 'badc'; }
+  else if (dm.alertLevel >= 2)  { txt = '⚠ 报警：请看路'; cls = 'badc'; }
+  else if (dm.distracted)       { txt = '⚠ 分心'; cls = 'warn'; }
+  else if (dm.faceDetected === false)
+                                { txt = 'op 未检测到人脸'; cls = 'warn'; }
+  else                          { txt = 'op 原版：无异常'; cls = 'ok'; }
+  badge.className = cls;
+  badge.textContent = txt;
+  $('#dmState').innerHTML = `<span class="${cls}">${txt}</span>`;
+}
+
+/* ---------- SSE ---------- */
+function connect(){
+  const es = new EventSource('/api/stream');
+  es.onmessage = ev => { try{ update(JSON.parse(ev.data)); }catch(e){} };
+  es.onerror = () => { $('#dotData').className = 'dot bad'; setTimeout(()=>{ es.close(); connect(); }, 1500); };
+}
+
+/* ---------- 左下分页 ---------- */
+document.querySelectorAll('[data-bl]').forEach(b => b.onclick = () => {
+  document.querySelectorAll('[data-bl]').forEach(x => x.classList.remove('sel'));
+  b.classList.add('sel');
+  last.bl = b.dataset.bl;
+  const isLog = last.bl === 'log';
+  $('#blStatus').style.display = isLog ? 'none' : '';
+  $('#blLog').style.display = isLog ? '' : 'none';
+  $('#blTitle').textContent = isLog ? '日志' : '状态 / 指标';
+  if (isLog) loadLog(last.logName);
+});
+
+/* ---------- 日志 ---------- */
+async function loadLog(name){
+  last.logName = name;
+  try{
+    const j = await (await fetch('/api/log?name=' + name)).json();
+    const box = $('#logbox');
+    const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 60;
+    box.textContent = (j.text || '').split('\n').slice(-220).join('\n') || '(空)';
+    if (atBottom) box.scrollTop = box.scrollHeight;
+  }catch(e){}
+}
+document.querySelectorAll('[data-log]').forEach(b => b.onclick = () => {
+  document.querySelectorAll('[data-log]').forEach(x => x.classList.remove('sel'));
+  b.classList.add('sel'); loadLog(b.dataset.log);
+});
+setInterval(()=>{ if (last.bl === 'log') loadLog(last.logName); }, 2000);
+
+/* ---------- 素材 ---------- */
+async function loadMaterials(){
+  try{
+    const j = await (await fetch('/api/materials')).json();
+    const g = $('#selGroup'), f = $('#selFile');
+    g.innerHTML = ''; (j.groups||[]).forEach(x => g.add(new Option(x.group, x.group)));
+    const fill = () => {
+      const grp = (j.groups||[]).find(x => x.group === g.value);
+      f.innerHTML = '';
+      (grp ? grp.files : []).forEach(x => f.add(new Option(x.name, x.path)));
+    };
+    g.onchange = fill; fill();
+  }catch(e){}
+}
+
+/* ---------- 按钮 ---------- */
+$('#btnImport').onclick = async () => {
+  toast('请在弹出的窗口里选择视频…');
+  const j = await post('/api/pick');
+  if (j.ok){
+    toast('已选择：' + j.path.split('/').pop());
+    await post('/api/import', {path:j.path});
+    toast('正在启动（免转码，秒开）…', 4000);
+  } else toast('未选择文件');
+};
+$('#btnStop').onclick = async () => { await post('/api/stop'); toast('正在停止…'); };
+// [恢复到主页 2026-09-30] 一键：切出 + 停止当前推理 → 退回 op 主页
+$('#btnHome').onclick = async () => {
+  const j = await post('/api/home');
+  toast(j && j.msg ? j.msg : '正在回到主页…', 4000);
+};
+// [slowroads App 自动接入 2026-09-30] 重新接入
+$('#btnSRReconnect').onclick = async () => {
+  const j = await post('/api/slowroads_reconnect');
+  toast(j && j.msg ? j.msg : (j && j.error ? ('失败：' + j.error) : '正在接入…'), 4000);
+};
+// [重新校准 2026-09-29] 清掉预置的假标定 → op 从零开始真校准（op 只在 >24km/h 直线行驶时采数据）
+$('#btnRecalib').onclick = async () => {
+  const j = await post('/api/recalibrate');
+  toast(j.ok ? (j.msg || '已触发重新校准') : ('失败：' + j.error), 6000);
+};
+$('#btnRestoreCalib').onclick = async () => {
+  const j = await post('/api/restore_calib');
+  toast(j.ok ? (j.msg || '已恢复预置标定') : ('失败：' + j.error), 6000);
+};
+// [slowroads 自动驾驶开关 2026-09-29] op 开 slowroads 总开关（启动/停止控制桥）
+$('#btnGameDrive').onclick = async () => {
+  const cur = (last.snap && last.snap.data && last.snap.data.game) ? !!last.snap.data.game.running : false;
+  const on = !cur;
+  const j = await post('/api/game_control', {on});
+  if (!j.ok){ toast('失败：' + (j.error || '未知错误'), 5000); return; }
+  toast(on ? 'op 已接管 slowroads —— 再点一次可停止' : '已停止，控制权还给你', 4000);
+};
+$('#btnPlaySel').onclick = async () => {
+  const p = $('#selFile').value;
+  if (!p){ toast('请选择素材'); return; }
+  await post('/api/import', {path:p});
+  toast('正在启动（免转码）：' + p.split('/').pop(), 4000);
+};
+$('#btnShot').onclick = async () => {
+  const j = await post('/api/export/opscreen');
+  toast(j.ok ? '已保存到桌面：' + j.path.split('/').pop() : ('失败：' + j.error), 4000);
+};
+$('#btnData').onclick = async () => {
+  const j = await post('/api/export/data');
+  toast(j.ok ? '已保存：' + j.path.split('/').pop() : ('失败：' + j.error), 4000);
+};
+$('#btnLong').onclick = async () => {
+  const cur = (last.snap && last.snap.data) ? !!last.snap.data.demoLong : false;
+  const on = !cur;
+  await post('/api/long', {enabled: on});
+  toast(on ? '已开启纵向接管（模拟按巡航键接管）' : '已关闭纵向接管（发 CANCEL 解除）');
+};
+$('#btnPerf').onclick = async () => {
+  const cur = (last.snap && last.snap.data) ? !!last.snap.data.perfAlert : false;
+  const on = !cur;
+  await post('/api/perf_alert', {enabled: on});
+  toast(on ? '已开启性能提示（延迟报警会显示并响铃）' : '已关闭性能提示（不再显示/响铃）');
+};
+/* [推理后端设置 2026-09-28] 切换模型推理引擎（ANE 神经引擎 / Metal tinygrad），栈在跑会自动重启 */
+async function setBackend(be){
+  const cur = (last.snap && last.snap.data && last.snap.data.modelBackend) ? last.snap.data.modelBackend : {};
+  const name = be === 'coreml' ? 'ANE 神经引擎' : 'Metal（tinygrad）';
+  if (cur.setting === be && cur.running === be){ toast('现在就是 ' + name); return; }
+  const j = await post('/api/model_backend', {backend: be});
+  if (!j.ok){ toast('切换失败：' + (j.error || '未知错误'), 4000); return; }
+  toast(j.restarted ? ('已切到 ' + name + '，正在自动重启演示（约 40 秒）…') : ('已保存：' + name + '（下次启动生效）'), 5000);
+}
+$('#btnAne').onclick = () => setBackend('coreml');
+$('#btnMetal').onclick = () => setBackend('tinygrad');
+/* [推理帧率设置 2026-09-29] 推理帧率档位：写 infer_fps.txt，相机每帧读 → 立即生效 */
+async function setFps(v){
+  const j = await post('/api/infer_fps', {fps: v});
+  if (!j.ok){ toast('设置失败：' + (j.error || '未知错误'), 4000); return; }
+  toast('推理帧率已设为 ' + v + ' fps（立即生效）');
+}
+$('#btnFps5').onclick = () => setFps(5);
+$('#btnFps10').onclick = () => setFps(10);
+$('#btnFps15').onclick = () => setFps(15);
+$('#btnFps20').onclick = () => setFps(20);
+/* [C1 补丁 2026-09-27] 播放控制 + 退出全部 */
+$('#btnPause').onclick = async () => {
+  const cur = (last.snap && last.snap.data && last.snap.data.playback) ? !!last.snap.data.playback.pause : false;
+  await post('/api/playback', {pause: !cur});
+  toast(!cur ? '已暂停（保持当前帧）' : '已继续播放');
+};
+$('#btnSpeed').onclick = async () => {
+  const cur = (last.snap && last.snap.data && last.snap.data.playback) ? Number(last.snap.data.playback.speed || 1) : 1;
+  const next = cur === 1 ? 2 : (cur === 2 ? 0.5 : 1);
+  await post('/api/playback', {speed: next});
+  toast('播放倍速：' + next + 'x');
+};
+$('#btnRestart').onclick = async () => {
+  await post('/api/playback', {restart: true});
+  toast('从头重播');
+};
+$('#btnQuit').onclick = async () => {
+  if (!confirm('退出全部？将停止 op 并关闭控制台。')) return;
+  await post('/api/quit');
+  toast('正在退出…', 4000);
+};
+
+/* [C2 补丁 2026-09-27] 点 op 画面 = 点真实 op 屏幕（归一化坐标转发给 UI 进程）
+   [P3 补丁 2026-09-27] 画面只能点、不能拖：禁用图片原生拖拽，且「按下后位移 > 8px」不算点击 */
+let _opDown = null;
+$('#opScreen').addEventListener('mousedown', (ev) => { _opDown = {x: ev.clientX, y: ev.clientY}; });
+$('#opScreen').addEventListener('dragstart', (ev) => ev.preventDefault());
+document.addEventListener('mouseup', () => { setTimeout(() => { _opDown = null; }, 0); });
+$('#opScreen').onclick = async (ev) => {
+  if (last.view === 'sr') return;   // [slowroads 视图 2026-09-30] 游戏画面只读，点击不转发给 op
+  if (_opDown){
+    const dx = ev.clientX - _opDown.x, dy = ev.clientY - _opDown.y;
+    if (Math.hypot(dx, dy) > 8){ _opDown = null; return; }   // 拖拽 → 不转发
+  }
+  const r = ev.target.getBoundingClientRect();
+  const x = Math.min(1, Math.max(0, (ev.clientX - r.left) / r.width));
+  const y = Math.min(1, Math.max(0, (ev.clientY - r.top) / r.height));
+  const wrap = $('#viewWrap').getBoundingClientRect();
+  const rip = document.createElement('div');
+  rip.className = 'ripple';
+  rip.style.left = (ev.clientX - wrap.left) + 'px';
+  rip.style.top = (ev.clientY - wrap.top) + 'px';
+  $('#viewWrap').appendChild(rip);
+  setTimeout(() => rip.remove(), 600);
+  const res = await post('/api/click', {x, y});
+  if (res && res.ok === false) toast('点击转发失败：' + (res.error || '未知错误'), 3000);
+};
+
+/* [方向盘重做 2026-09-27] 固定刻度盘：0° 在正上方，每 15° 一格（±45/±90/±135/180 加长加亮） */
+(() => {
+  const NS = 'http://www.w3.org/2000/svg', g = $('#scaleTicks');
+  if (!g) return;
+  for (let a = -180; a < 180; a += 15){
+    const major = (a % 45 === 0);
+    const rad = (a - 90) * Math.PI / 180;      // a=0 → 正上方
+    const r1 = major ? 49 : 52.5, r2 = 58;
+    const l = document.createElementNS(NS, 'line');
+    l.setAttribute('x1', (60 + r1 * Math.cos(rad)).toFixed(1));
+    l.setAttribute('y1', (60 + r1 * Math.sin(rad)).toFixed(1));
+    l.setAttribute('x2', (60 + r2 * Math.cos(rad)).toFixed(1));
+    l.setAttribute('y2', (60 + r2 * Math.sin(rad)).toFixed(1));
+    l.setAttribute('stroke', major ? 'rgba(255,255,255,.42)' : 'rgba(255,255,255,.15)');
+    l.setAttribute('stroke-width', major ? '2' : '1.1');
+    l.setAttribute('stroke-linecap', 'round');
+    g.appendChild(l);
+  }
+})();
+
+/* ---------- 启动 ---------- */
+loadMaterials();
+connect();
+loadLog('stack');
+</script>
+</body>
+</html>

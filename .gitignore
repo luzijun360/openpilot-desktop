@@ -1,0 +1,79 @@
+# openpilot-mac: overlay repo — upstream sources are fetched by scripts/setup.sh
+# Python / venv
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.cache/
+
+# Build artifacts
+.sconsign.dblite
+*.o
+*.os
+*.so
+*.a
+*.dylib
+*.DSYM
+compile_commands.json
+openpilot/compile_commands.json
+.msgq/
+/opendbc/
+/rednose/
+/teleoprtc/
+/tinygrad/
+bin/
+
+# Large binaries — fetched via git-lfs from upstream or Release
+*.onnx
+*.pkl
+*.mlpackage
+*.mlmodel
+*.bin
+*.onnx.data
+
+# Media — use docs/测试素材说明.md + Release demo sample instead
+*.mp4
+*.mov
+*.avi
+*.mkv
+
+# Runtime state (generated locally)
+offline_demo/logs/
+offline_demo/frames/
+offline_demo/*.flag
+offline_demo/*.jpg
+offline_demo/*.png
+offline_demo/*.pid
+offline_demo/*.log
+offline_demo/*.mp4
+offline_demo/*.json.bak
+offline_demo/GameWindow.app/
+offline_demo/click_at
+offline_demo/mouse_at
+offline_demo/mouse_daemon
+offline_demo/game_window
+offline_demo/slowroads_app.log
+offline_demo/slowroads_connect.log
+ane-convert/.venv*/
+ane-convert/*.onnx
+ane-convert/*.mlpackage
+
+# macOS / IDE
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Secrets
+.env
+*.pem

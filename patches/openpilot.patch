@@ -1,0 +1,1457 @@
+diff --git a/msgq_repo b/msgq_repo
+index 0e266c1..326a9f5 160000
+--- a/msgq_repo
++++ b/msgq_repo
+@@ -1 +1 @@
+-Subproject commit 0e266c1dbcf7328beee3e57b4a8688555387c877
++Subproject commit 326a9f5aa6cf630f647fd6996106aa267dd01c2a-dirty
+diff --git a/opendbc_repo b/opendbc_repo
+index 4134c0d..201b610 160000
+--- a/opendbc_repo
++++ b/opendbc_repo
+@@ -1 +1 @@
+-Subproject commit 4134c0d1f5e8f695e35ea5fedbe88f6d0c3afb76
++Subproject commit 201b61080082b6d3512038517eef21fc88ec5812-dirty
+diff --git a/openpilot/selfdrive/modeld/dmonitoringmodeld.py b/openpilot/selfdrive/modeld/dmonitoringmodeld.py
+index 5a6e921..81bc83d 100755
+--- a/openpilot/selfdrive/modeld/dmonitoringmodeld.py
++++ b/openpilot/selfdrive/modeld/dmonitoringmodeld.py
+@@ -53,13 +53,12 @@ class ModelState:
+     t1 = time.perf_counter()
+     self.tensor_inputs['calib']._buffer().copy_from(self.calib_host)
+ 
+-    ptr = np.frombuffer(buf.data, dtype=np.uint8).ctypes.data
+-    # There is a ringbuffer of imgs, just cache tensors pointing to all of them
+-    if ptr not in self._blob_cache:
+-      self._blob_cache[ptr] = Tensor.from_blob(ptr, (self.frame_buf_params[3],), dtype='uint8', device=self.DEV)
+-
++    # [macOS 移植补丁] 原实现用 Tensor.from_blob 直接引用 VIPC 共享内存做零拷贝，
++    # 但 tinygrad 的 Metal 后端在 from_blob 上必然段错误（SIGSEGV），改为拷贝成普通张量。
++    frame_np = np.frombuffer(buf.data, dtype=np.uint8)[:self.frame_buf_params[3]]
+     self.warp_inputs_np['transform'][:] = transform[:]
+-    self.tensor_inputs['input_img'] = self.image_warp(input_frame=self._blob_cache[ptr], M_inv=self.warp_inputs['transform'])
++    self.tensor_inputs['input_img'] = self.image_warp(input_frame=Tensor(frame_np.copy(), dtype='uint8', device=self.DEV),
++                                                      M_inv=self.warp_inputs['transform'])
+ 
+     self.model_run(output_buffers=self.outputs, **self.tensor_inputs)
+     output = self.outputs['outputs'].numpy().astype(np.float32).reshape(-1)
+@@ -102,7 +101,8 @@ def get_driverstate_packet(model_output, frame_id: int, location_ts: int, exec_t
+   ds.modelExecutionTime = exec_time
+   ds.gpuExecutionTime = gpu_exec_time
+   ds.rawPredictions = model_output['raw_pred']
+-  ds.wheelOnRightProb = model_output['wheel_on_right'][0, 0].item()
++  # [macOS 移植补丁] Mac 摄像头上模型对左右舵的判断不可靠；本项目用左舵假车（Honda Civic），固定为 0
++  ds.wheelOnRightProb = 0.0
+   fill_driver_data(ds.leftDriverData, model_output, 'lhd')
+   fill_driver_data(ds.rightDriverData, model_output, 'rhd')
+   return msg
+@@ -125,31 +125,80 @@ def main():
+   pm = PubMaster(["driverStateV2"])
+ 
+   calib = np.zeros(model.numpy_inputs['calib'].size, dtype=np.float32)
+-  model_transform = None
++  # [macOS 移植补丁] op 原版假设驾驶员固定在鱼眼画面某处；Mac 摄像头视场不同。
++  # 前 CALIB_FRAMES 帧扫 3x3 个候选窗口找出驾驶员，之后【锁定】该窗口——
++  # 绝不能每帧都取最高分：那样遮住脸时模型仍会在某个窗口凑出高分，注意力检测就失效了。
++  CALIB_FRAMES = 15
++  # 扫两种取景尺度：1.0（原尺寸）和 0.85（略放大画面，实测眼睛/睡意信号更好）
++  candidate_transforms = []
++  for s in (1.0, 0.85):
++    for ty in (240.0, 120.0, 0.0):
++      for tx in (-240.0, -120.0, 0.0):
++        candidate_transforms.append(np.array([[s, 0, tx * s], [0, s, ty * s], [0, 0, 1]], dtype=np.float32))
++  lock_transform = None
++  track_prev = None
++  scores = np.zeros(len(candidate_transforms))
++  frame_count = 0
++  lost_since = None
+ 
+   while True:
+     buf = vipc_client.recv()
+     if buf is None:
+       continue
+ 
+-    if model_transform is None:
+-      cam = _os_fisheye if buf.width == _os_fisheye.width else _ar_ox_fisheye
+-      model_transform = np.linalg.inv(np.dot(dmonitoringmodel_intrinsics, np.linalg.inv(cam.intrinsics))).astype(np.float32)
++    # [降载] 隔帧推理：DM 不需要 30fps，减半后省下的 CPU 留给控制循环
++    if vipc_client.frame_id % 2:
++      continue
+ 
+     sm.update(0)
+     if sm.updated["extrinsicsCalibration"]:
+       calib[:] = np.array(sm["extrinsicsCalibration"].rpyCalib)
+ 
+     t1 = time.perf_counter()
+-    model_output, gpu_execution_time = model.run(buf, calib, model_transform)
++
++    if lock_transform is None:
++      # ---- 校准阶段：累计评估所有候选窗口，取总分最高的 ----
++      for i, tr in enumerate(candidate_transforms):
++        out, _gt = model.run(buf, calib, tr)
++        parsed = parse_model_output(slice_outputs(out, model.output_slices))
++        # 打分：人脸为主，眼睛加权（眼睛信号好坏直接决定困倦/眨眼能不能用）
++        scores[i] += float(parsed['face_prob_lhd'][0, 0]) + 0.3 * (float(parsed['left_eye_prob_lhd'][0, 0]) + float(parsed['right_eye_prob_lhd'][0, 0]))
++      frame_count += 1
++      if frame_count >= CALIB_FRAMES:
++        lock_transform = candidate_transforms[int(np.argmax(scores))]
++        cloudlog.warning(f"DM window locked at {lock_transform[:2, 2].tolist()}")
++      continue
++
++    # ---- 锁定阶段：只用选定的窗口，人脸丢了就如实报低分 ----
++    out, gpu_execution_time = model.run(buf, calib, lock_transform)
+     t2 = time.perf_counter()
+-    raw_pred = model_output.tobytes() if SEND_RAW_PRED else b''
+-    model_output = slice_outputs(model_output, model.output_slices)
+-    model_output = parse_model_output(model_output)
++    raw_pred = out.tobytes() if SEND_RAW_PRED else b''
++    model_output = parse_model_output(slice_outputs(out, model.output_slices))
+     model_output['raw_pred'] = raw_pred
++
++    # [macOS 移植补丁] 曾试过用模型输出的脸位置做闭环跟踪窗口，但该输出带噪声，
++    # 增量累积会随机游走、把窗口漂到极限位置导致人脸彻底丢失——所以维持「校准后锁定」。
+     msg = get_driverstate_packet(model_output, vipc_client.frame_id, vipc_client.timestamp_sof, t2 - t1, gpu_execution_time)
+     pm.send("driverStateV2", msg)
+ 
++    # [macOS 移植补丁] 实时输出关键指标，方便对着镜头做动作验证（约每 0.4 秒一行）
++    if vipc_client.frame_id % 10 == 0:
++      eyeL, eyeR = model_output['left_eye_prob_lhd'][0, 0], model_output['right_eye_prob_lhd'][0, 0]
++      cloudlog.warning("DMLIVE 人脸 %.2f | 左眼 %.2f 右眼 %.2f | 睡意 %.2f | 手机 %.2f | %s | 窗口 %+.0f,%+.0f" % (
++        model_output['face_prob_lhd'][0, 0], eyeL, eyeR,
++        model_output['sleep_prob_lhd'][0, 0], model_output['using_phone_prob_lhd'][0, 0],
++        '闭眼' if (eyeL < 0.3 and eyeR < 0.3) else '睁眼',
++        lock_transform[0, 2], lock_transform[1, 2]))
++
++    # 长时间找不到人脸（换位置了）才重新校准；短暂遮挡不会触发
++    if model_output['face_prob_lhd'][0, 0] < 0.3:
++      if lost_since is None:
++        lost_since = time.monotonic()
++      elif time.monotonic() - lost_since > 20.0:
++        lock_transform, scores, frame_count, lost_since = None, np.zeros(len(candidate_transforms)), 0, None
++    else:
++      lost_since = None
++
+ 
+ if __name__ == "__main__":
+   try:
+diff --git a/openpilot/selfdrive/modeld/fill_model_msg.py b/openpilot/selfdrive/modeld/fill_model_msg.py
+index 055c182..7468947 100644
+--- a/openpilot/selfdrive/modeld/fill_model_msg.py
++++ b/openpilot/selfdrive/modeld/fill_model_msg.py
+@@ -176,7 +176,11 @@ def fill_model_msg(msg: capnp._DynamicStructBuilder, net_output_data: dict[str,
+ 
+ def fill_pose_msg(msg: capnp._DynamicStructBuilder, net_output_data: dict[str, np.ndarray],
+                   vipc_frame_id: int, vipc_dropped_frames: int, timestamp_eof: int, extrinsics_calibration_seen: bool) -> None:
+-  msg.valid = extrinsics_calibration_seen & (vipc_dropped_frames < 1)
++  # [离线视频移植补丁] 去掉「必须无丢帧」条件：本机模型只能跑 ~11Hz，而相机 20fps，
++  # 丢帧是常态 → cameraOdometry 约 60% 时间 valid=False → 级联使 calibrationd/lagd/
++  # paramsd 全无效 → commIssue → 周期性软退出接管（屏幕一直报警）。
++  # 姿态数据本身仍照常计算，仅放开这个健康标志。
++  msg.valid = extrinsics_calibration_seen
+   cameraOdometry = msg.cameraOdometry
+ 
+   cameraOdometry.frameId = vipc_frame_id
+diff --git a/openpilot/selfdrive/modeld/modeld.py b/openpilot/selfdrive/modeld/modeld.py
+index 0d90f12..42329a9 100755
+--- a/openpilot/selfdrive/modeld/modeld.py
++++ b/openpilot/selfdrive/modeld/modeld.py
+@@ -158,12 +158,45 @@ class ModelState:
+     with open(MODELS_DIR / f'{"big_" if chestnut else ""}driving_warp_{cam_w}x{cam_h}_tinygrad.pkl', 'rb') as f:
+       self.run_warp = pickle.load(f)['run']
+     self.run_warp.captured._linear = lower_and_compile(self.run_warp.captured._linear)
+-    self.run_model = jits['run']
+-    self.run_model.captured._linear = lower_and_compile(self.run_model.captured._linear)
+-    self.outputs = {name: Tensor(np.zeros(shape, dtype=dtype), device=device).realize() for name, (shape, dtype, device) in jits['output_specs'].items()}
+-    for name, next_name in self.state_pairs.items():
+-      state = self.input_queues[name]
+-      self.outputs[next_name] = input_view(state._buffer(), state.shape, state.dtype, 0)
++    # [ANE 接入 2026-09-28] OP_MODEL_BACKEND=coreml 时改用 CoreML(神经引擎) 推理；
++    # 默认仍是 tinygrad，出问题把环境变量去掉即可回退（下方 lower_and_compile 是 tinygrad 专属）
++    self.model_backend = os.environ.get('OP_MODEL_BACKEND', 'tinygrad')
++    if self.model_backend == 'coreml':
++      from openpilot.selfdrive.modeld.coreml_runner import CoreMLRunner
++      self.run_model = CoreMLRunner(
++        model_path=str(MODELS_DIR / 'driving_supercombo.mlpackage'),
++        state_pairs=self.state_pairs,
++        output_specs=jits['output_specs'],
++        compute_unit=os.environ.get('OP_COREML_UNITS', 'CPU_AND_NE'),
++      )
++      cloudlog.warning("modeld: CoreML(ANE) 后端已启用（warp 仍走 tinygrad）")
++    else:
++      self.run_model = jits['run']
++      self.run_model.captured._linear = lower_and_compile(self.run_model.captured._linear)
++    # [推理后端设置 2026-09-28] 把实际使用的后端写下来，控制台据此显示「现在跑在什么上」
++    # （macOS 上 ps eww 读不到别的进程的环境变量，所以用标记文件）
++    _marker = os.environ.get('OP_MODEL_BACKEND_MARKER')
++    if _marker:
++      try:
++        with open(_marker, 'w') as f:
++          f.write(self.model_backend)
++      except Exception:
++        pass
++    if self.model_backend == 'coreml':
++      # [ANE 接入 2026-09-28] CoreML 路径下模型输入输出全部用 numpy 缓冲：
++      # 每帧十几次 tinygrad 张量读写（.numpy()/assign().realize()）的调度开销
++      # 会把 ANE 省下的时间吃掉，是 CPU 占用的主要来源。
++      from openpilot.selfdrive.modeld.coreml_runner import NumpyBuffer
++      self.outputs = {name: NumpyBuffer(np.zeros(shape, dtype=np.dtype(dtype)))
++                      for name, (shape, dtype, _) in jits['output_specs'].items()}
++      for name in self.state_pairs:
++        _shape, _dtype = self.input_shapes[name]
++        self.input_queues[name] = NumpyBuffer(np.zeros(_shape, dtype=_dtype))
++    else:
++      self.outputs = {name: Tensor(np.zeros(shape, dtype=dtype), device=device).realize() for name, (shape, dtype, device) in jits['output_specs'].items()}
++      for name, next_name in self.state_pairs.items():
++        state = self.input_queues[name]
++        self.outputs[next_name] = input_view(state._buffer(), state.shape, state.dtype, 0)
+     self.parser = Parser()
+ 
+   def pack_inputs(self) -> None:
+@@ -225,6 +258,31 @@ class ModelState:
+       self.input_queues[key].assign(0).realize()
+     self.prev_desire[:] = 0
+ 
++  def reset_state(self) -> None:
++    # [跳变追查 2026-09-29] 清零循环状态（与 warmup 末尾同一套操作）。用途：画面中断
++    # （记忆过期）或输出锁死在固定点（漂移幻觉：实测 4 条线全亮 + 幻影前车、逐帧一字不差）
++    # 时，让模型从干净状态重新起步。零状态起步后头几帧输出轻微抖动，随后恢复正常。
++    for key in self.state_pairs:
++      self.input_queues[key].assign(0).realize()
++    self.prev_desire[:] = 0
++
++
++def _drift_sig_vec(model_output):
++  # [跳变追查 2026-09-29] 漂移签名：4 条车道线概率 + 3 个前车概率（共 7 个值）。
++  # 固定点下逐帧一字不差；正常行车每帧都在变 → 用于「输出锁死」检测。
++  # [修正 2026-09-29 深夜] 车道线取值必须与 fill_model_msg.py:108 完全一致：lane_lines_prob[0, 1::2]
++  # （原实现用 [0:4] 取到了偶数位元素，导致指纹永远匹配不上——这就是熔断 0 次触发的原因）
++  try:
++    lp_raw = np.asarray(model_output['lane_lines_prob'], dtype=np.float32)
++    if lp_raw.ndim >= 2:
++      lp = lp_raw[0, 1::2].ravel()[:4]
++    else:
++      lp = lp_raw.ravel()[1::2][:4]
++    ld = np.asarray(model_output['lead_prob'], dtype=np.float32).ravel()[:3]
++    return np.concatenate([lp, ld])
++  except Exception:
++    return None
++
+ 
+ def main(demo=False):
+   cloudlog.warning("modeld init")
+@@ -325,6 +383,21 @@ def main(demo=False):
+ 
+   DH = DesireHelper()
+ 
++  # [跳变追查 2026-09-29] 漂移熔断（回退：OP_MODEL_DRIFT_RESET=0）：循环网络在「无新信息」
++  # 输入流下会滑进固定点（实测：4 条线全亮 + 幻影前车，逐帧一字不差）。两个触发：
++  #   a) 距上一帧 >0.5s（画面中断，记忆过期）→ 本次运行前先清零；
++  #   b) 输出连续 >1.5s 几乎一字不差（已锁死）→ 立即清零，下一帧起重新收敛。
++  drift_reset_enabled = os.getenv('OP_MODEL_DRIFT_RESET', '1') != '0'
++  last_run_mono = 0.0
++  last_out_vec = None
++  last_out_change_mono = 0.0
++  drift_reset_count = 0
++  # [漂移指纹 2026-09-29] 实测固定点逐字节一致：4 条车道线 [0.85,0.96,0.90,0.22] + 幻影前车 0.54@69.31m
++  _ATTR_LANE = np.array([0.85, 0.96, 0.90, 0.22], dtype=np.float32)
++  # [帧率时差修正 2026-09-29] 输入帧率 <20fps 时把真实帧周期喂给模型（action_t），替代硬编码
++  # 20Hz 假设（回退：OP_MODEL_TRUE_TIMING=0；20fps 下与原来完全一致）
++  true_timing_enabled = os.getenv('OP_MODEL_TRUE_TIMING', '1') != '0'
++
+   while True:
+     # Keep receiving frames until we are at least 1 frame ahead of previous extra frame
+     while meta_main.timestamp_sof < meta_extra.timestamp_sof + 25000000:
+@@ -403,6 +476,21 @@ def main(demo=False):
+       'action_t': np.array([lat_action_t, long_action_t], dtype=np.float32),
+     }
+ 
++    if drift_reset_enabled and last_run_mono > 0.0:
++      _gap = time.monotonic() - last_run_mono
++      if _gap > 0.5:
++        model.reset_state()
++        drift_reset_count += 1
++        print(f"[modeld] 画面中断 {_gap:.1f}s → 重置模型循环状态（第 {drift_reset_count} 次）", flush=True)
++
++    if true_timing_enabled and last_run_mono > 0.0:
++      # [帧率时差修正 2026-09-29] 真实帧周期（≈上帧到本帧间隔），夹在 [DT_MDL, 0.2s]。
++      # 实测输入 7-13fps 时模型仍按 50ms 预测 → 运动估计 2-3 倍偏差 → 状态发散漂移。
++      _period = float(min(max(time.monotonic() - last_run_mono, DT_MDL), 0.2))
++      lat_action_t = lat_delay + _period + _period / 2.0
++      long_action_t = long_delay + _period + _period / 2.0
++      inputs['action_t'] = np.array([lat_action_t, long_action_t], dtype=np.float32)
++
+     mt1 = time.perf_counter()
+     try:
+       send_chestnut = (chestnut_state is not None and
+@@ -421,8 +509,32 @@ def main(demo=False):
+       model_output = None
+     mt2 = time.perf_counter()
+     model_execution_time = mt2 - mt1
++    last_run_mono = time.monotonic()
+ 
+     if model_output is not None:
++      # [漂移指纹 2026-09-29] 命中精确指纹（4 条车道线全亮 + 幻影前车）→ 立即清零，不等 1.5s 锁死
++      # （实测漂移常以「进出交替」形态出现，锁死检测抓不到；指纹则逐字节精确）
++      if drift_reset_enabled:
++        _vec_p = _drift_sig_vec(model_output)
++        if _vec_p is not None and _vec_p.shape[0] >= 5 and np.allclose(_vec_p[:4], _ATTR_LANE, rtol=0.0, atol=0.04) and _vec_p[4] > 0.4:
++          model.reset_state()
++          drift_reset_count += 1
++          print(f"[modeld] 命中漂移指纹（4线+幻影车）→ 立即重置模型循环状态（第 {drift_reset_count} 次）", flush=True)
++
++      # [跳变追查 2026-09-29] 输出锁死检测：连续 >1.5s 几乎一字不差 = 掉进固定点 → 重置
++      if drift_reset_enabled:
++        _vec = _drift_sig_vec(model_output)
++        _now = time.monotonic()
++        if _vec is not None:
++          if last_out_vec is not None and _vec.shape == last_out_vec.shape and np.allclose(_vec, last_out_vec, rtol=0.0, atol=0.005):
++            if _now - last_out_change_mono > 1.5:
++              model.reset_state()
++              drift_reset_count += 1
++              print(f"[modeld] 输出锁死 {_now - last_out_change_mono:.1f}s（漂移固定点）→ 重置模型循环状态（第 {drift_reset_count} 次）", flush=True)
++              last_out_vec, last_out_change_mono = None, _now
++          else:
++            last_out_vec, last_out_change_mono = _vec, _now
++
+       modelv2_send = messaging.new_message('modelV2')
+       drivingdata_send = messaging.new_message('drivingModelData')
+       posenet_send = messaging.new_message('cameraOdometry')
+diff --git a/openpilot/selfdrive/selfdrived/events.py b/openpilot/selfdrive/selfdrived/events.py
+index b430b91..1495357 100755
+--- a/openpilot/selfdrive/selfdrived/events.py
++++ b/openpilot/selfdrive/selfdrived/events.py
+@@ -495,7 +495,10 @@ EVENTS: dict[int, dict[str, Alert | AlertCallbackType]] = {
+       "BRAKE!",
+       "Risk of Collision",
+       AlertStatus.critical, AlertSize.full,
+-      Priority.HIGHEST, VisualAlert.fcw, AudibleAlert.warningSoft, 2.),
++      Priority.HIGHEST, VisualAlert.fcw, AudibleAlert.none, 2.),
++    # [AEB 静音 2026-09-28] 原为 AudibleAlert.warningSoft。离线 demo 里 AEB 触发的就是这条 FCW
++    # 警报，用户要求「只要 TSS 音效」→ op 原版警报静音（画面上的「BRAKE!」红色警示保留不动）。
++    # 回退：把 AudibleAlert.none 改回 AudibleAlert.warningSoft。
+   },
+ 
+   EventName.ldw: {
+diff --git a/openpilot/selfdrive/selfdrived/selfdrived.py b/openpilot/selfdrive/selfdrived/selfdrived.py
+index 0a46809..0fbe226 100755
+--- a/openpilot/selfdrive/selfdrived/selfdrived.py
++++ b/openpilot/selfdrive/selfdrived/selfdrived.py
+@@ -38,6 +38,19 @@ PandaType = log.PandaState.PandaType
+ LaneChangeState = log.LaneChangeState
+ LaneChangeDirection = log.LaneChangeDirection
+ EventName = log.OnroadEvent.EventName
++
++# [性能提示开关 2026-09-27] 离线 demo：System Lagging 报警是误报（无真车、Mac 算力有限，op 会
++# 误判控制循环跟不上）。控制台「性能提示」开关写这个 flag 文件；内容非 "0" = 显示报警（含警报声）。
++# 默认关闭：文件不存在 = 不提示、不响铃。
++PERF_ALERT_FLAG = os.environ.get("PERF_ALERT_FLAG", "/Users/lu/op项目of all/openpilot/offline_demo/perf_alert.flag")
++
++
++def perf_alert_enabled() -> bool:
++  try:
++    with open(PERF_ALERT_FLAG) as f:
++      return f.read().strip() != "0"
++  except Exception:
++    return False
+ ButtonType = car.CarState.ButtonEvent.Type
+ SafetyModel = car.CarParams.SafetyModel
+ AlertLevel = log.DriverMonitoringState.AlertLevel
+@@ -85,6 +98,10 @@ class SelfdriveD:
+     ignore = self.sensor_packets + self.gps_packets + ['alertDebug', 'lateralManeuverPlan']
+     if SIMULATION:
+       ignore += ['cabinCameraState', 'managerState']
++      # [离线视频移植补丁] 无真实横向执行机构：extrinsicsCalibration 及其下游的横向估计器
++      # (lagd→lateralDelay / torqued→lateralTorqueParameters) 永远不会收敛，会让
++      # all_checks() 长期为假 → commIssue → 周期性软退出接管。仅影响 SIMULATION 下的健康门限。
++      ignore += ['extrinsicsCalibration', 'lateralDelay', 'lateralTorqueParameters']
+     if REPLAY:
+       # no vipc in replay will make them ignored anyways
+       ignore += ['narrowRoadCameraState', 'wideRoadCameraState']
+@@ -134,7 +151,9 @@ class SelfdriveD:
+     self.rk = Ratekeeper(100, print_delay_threshold=None)
+ 
+     # Determine startup event
+-    self.startup_event = EventName.startup if build_metadata.openpilot.comma_remote and build_metadata.tested_channel else EventName.startupMaster
++    # [A4 修复 2026-09-27] 强制正常启动提示：本机是本地构建、不在 comma 渠道，
++    # 原逻辑每次启动都弹 "WARNING: This branch is not tested"（用户要求关掉）。
++    self.startup_event = EventName.startup
+     if HARDWARE.get_device_type() == 'mici':
+       self.startup_event = None
+     if not car_recognized:
+@@ -361,7 +380,9 @@ class SelfdriveD:
+           self.events.add(EventName.cameraMalfunction)
+         elif not self.sm.all_freq_ok(self.camera_packets):
+           self.events.add(EventName.cameraFrameRate)
+-    if not REPLAY and self.rk.lagging:
++    if not REPLAY and self.rk.lagging and perf_alert_enabled():
++      # [性能提示开关 2026-09-27] 开关关闭时这里直接不产生报警：界面提示和 soundd 的警报声
++      # 都由这个事件驱动，掐掉源头即两者一起静默。
+       self.events.add(EventName.selfdrivedLagging)
+     if self.CP.openpilotLongitudinalControl:
+       if self.sm['radarState'].radarErrors.canError:
+diff --git a/openpilot/selfdrive/ui/onroad/model_renderer.py b/openpilot/selfdrive/ui/onroad/model_renderer.py
+index 18fe45d..45a4e18 100644
+--- a/openpilot/selfdrive/ui/onroad/model_renderer.py
++++ b/openpilot/selfdrive/ui/onroad/model_renderer.py
+@@ -73,9 +73,12 @@ class ModelRenderer(Widget):
+     )
+ 
+     # Get longitudinal control setting from car parameters
++    # [A5 修复 2026-09-27] 记录「是否已从消息里读到过 CarParams」：读不到就每帧重试（见 _render）
++    self._cp_loaded = False
+     if car_params := Params().get("CarParams"):
+       cp = messaging.log_from_bytes(car_params, car.CarParams)
+       self._longitudinal_control = cp.openpilotLongitudinalControl
++      self._cp_loaded = True
+ 
+   def set_transform(self, transform: np.ndarray):
+     self._car_space_transform = transform.astype(np.float32)
+@@ -100,8 +103,12 @@ class ModelRenderer(Widget):
+     extrinsics_calibration = sm['extrinsicsCalibration']
+     self._path_offset_z = extrinsics_calibration.height[0] if extrinsics_calibration.height else HEIGHT_INIT[0]
+ 
+-    if sm.updated['carParams']:
++    # [A5 修复 2026-09-27] 原来只在 sm.updated['carParams'] 那一帧读：CarParams 参数被
++    # CLEAR_ON_MANAGER_START 清空后，UI 经常错过那一帧，要等 card 每 50s 重发才补上 →
++    # 前车三角要 ~50 秒才出现。改为：手上有有效数据（sm.valid）且还没读到过，就一直读。
++    if sm.updated['carParams'] or (sm.valid['carParams'] and not self._cp_loaded):
+       self._longitudinal_control = sm['carParams'].openpilotLongitudinalControl
++      self._cp_loaded = True
+ 
+     model = sm['modelV2']
+     radar_state = sm['radarState'] if sm.valid['radarState'] else None
+diff --git a/openpilot/system/camerad/webcam/camera.py b/openpilot/system/camerad/webcam/camera.py
+index 7926766..c19740d 100644
+--- a/openpilot/system/camerad/webcam/camera.py
++++ b/openpilot/system/camerad/webcam/camera.py
+@@ -1,39 +1,640 @@
++import hashlib
++import os
++import time
++import numpy as np
+ import av
+ import cv2 as cv
+ 
++from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
++
++# [静止帧去重 2026-09-29] 画面内容没变就不发布（见 read_frames 注释）。
++# 一条命令回退：OP_CAM_SKIP_STATIC=0
++SKIP_STATIC_FRAMES = os.getenv("OP_CAM_SKIP_STATIC", "1") != "0"
++
++# [连贯性门 2026-09-29] 累计运动门（第二层防漂移）：与 ~1.5s 前的参考帧比，画面累计几乎没动
++# （慢爬/冻结/卡顿重画）→ 不喂模型。循环网络吃「没新信息」的流会滑进固定点（实测 4 条线全亮
++# + 幻影前车、逐帧一字不差）。真实行车（约 1km/h 以上）1.5s 累计变化远超阈值，不受影响。
++# 回退：OP_CAM_MIN_MOTION=0；窗口/阈值：OP_CAM_MOTION_WINDOW / OP_CAM_MOTION_PCT / OP_CAM_MOTION_MEAN
++MOTION_GATE = os.getenv("OP_CAM_MIN_MOTION", "1") != "0"
++MOTION_WINDOW = float(os.getenv("OP_CAM_MOTION_WINDOW", "1.5"))
++MOTION_PCT = float(os.getenv("OP_CAM_MOTION_PCT", "0.04"))
++MOTION_MEAN = float(os.getenv("OP_CAM_MOTION_MEAN", "1.5"))
++
++# [推理帧率设置 2026-09-29] 控制台「推理帧率」写的是 demo 目录下的 infer_fps.txt（内容如 "10"）。
++# 相机发布率被压到这个值；modeld 是按帧驱动的（收到一帧推理一次）→ 等于推理帧率。
++# 每 1 秒重读一次文件 → 控制台改完立即生效，不用重启。
++_INFER_FPS_CACHE = {"t": -10.0, "v": None}
++
++def _target_fps():
++  now = time.monotonic()
++  if now - _INFER_FPS_CACHE["t"] < 1.0:
++    return _INFER_FPS_CACHE["v"]
++  v = None
++  try:
++    with open(os.path.join(os.getenv("OP_PLAYBACK_DIR", "/Users/lu/op项目of all/openpilot/offline_demo"), "infer_fps.txt")) as f:
++      n = float(f.read().strip())
++      if 1.0 <= n <= 60.0:
++        v = n
++  except Exception:
++    v = None
++  _INFER_FPS_CACHE["t"] = now
++  _INFER_FPS_CACHE["v"] = v
++  return v
++
++def _scene_same(a, b):
++  # [闪动修复 v3 2026-09-29] 判定「画面几乎没动」：显著变化(>8)的采样点 <0.3% 且平均差 <0.5。
++  # 只拦「逐像素级相同」的重复帧（卡顿重发）；任何真实运动（哪怕 1px 慢移）都会超过阈值照常发布。
++  d = np.abs(a.astype(np.int16) - b.astype(np.int16))
++  return bool((d > 8).mean() < 0.003 and d.mean() < 0.5)
++
++def _scene_moved(a, b):
++  # [连贯性门 2026-09-29] 判定「画面真的动了」（1.5s 累计窗口用）：显著变化(>8)的采样点 >4%
++  # 或平均差 >1.5。与 _scene_same（0.3%/0.5）之间的「慢爬带」= 没新信息 → 不喂模型。
++  d = np.abs(a.astype(np.int16) - b.astype(np.int16))
++  return bool((d > 8).mean() > MOTION_PCT or d.mean() > MOTION_MEAN)
++
++
+ class Camera:
+   def __init__(self, cam_type_state, stream_type, camera_id):
+     try:
+       camera_id = int(camera_id)
+     except ValueError: # allow strings, ex: /dev/video0
+       pass
++    # [离线视频移植补丁] 非 /dev/ 的字符串路径视为视频文件：不翻转、播完循环
++    self.is_video_file = isinstance(camera_id, str) and not camera_id.startswith("/dev/")
++    # [BeamNG 移植补丁] .jpg/.jpeg 路径 = 实时帧源：由外部程序（ffmpeg 抓屏）不断覆盖写这个文件，
++    # 这里按文件修改时间判断有没有新帧。用于把 BeamNG 实时画面喂给 modeld。
++    self.is_jpeg_source = isinstance(camera_id, str) and camera_id.lower().endswith((".jpg", ".jpeg"))
+     self.cam_type_state = cam_type_state
+     self.stream_type = stream_type
+     self.cur_frame_id = 0
+ 
+     print(f"Opening {cam_type_state} at {camera_id}")
+ 
+-    self.cap = cv.VideoCapture(camera_id)
++    # [播放管线补丁 2026-09-27] 目标输出尺寸：cabin → 1344x760（dmonitoringmodeld 的 warp 尺寸），
++    # road → 1928x1208（PC 端内参按这个尺寸，driving_warp_1928x1208）。任意分辨率的视频源
++    # 都在播放时实时对齐（免转码），见 fit_to_target。
++    self.target_size = (1344, 760) if "cabin" in cam_type_state else (1928, 1208)
++
++    if self.is_jpeg_source:
++      self.jpeg_path = camera_id
++      self.cap = None
++      self.W, self.H = float(self.target_size[0]), float(self.target_size[1])
++      return
+ 
+-    self.cap.set(cv.CAP_PROP_FRAME_WIDTH, 1280.0)
+-    self.cap.set(cv.CAP_PROP_FRAME_HEIGHT, 720.0)
+-    self.cap.set(cv.CAP_PROP_FPS, 25.0)
++    # [降占用补丁 2026-09-28] 视频文件默认走 PyAV 解码：直出 NV12（缩放+转色一趟 swscale 完成），
++    # 省掉 cv2 的 BGR 中转和两次全幅拷贝。离线实测每帧 CPU 22ms → 9ms（-60%）。
++    # OP_CAM_BACKEND=cv2 可一键回退旧路径。
++    self.video_path = camera_id
++    self.use_pyav = self.is_video_file and os.getenv("OP_CAM_BACKEND", "pyav") == "pyav"
++    self.cap = None
++    self._container = None
++    self._stream = None
++    self._iter = None
++    self.native_fps = 0.0
++    if self.use_pyav:
++      try:
++        self._open_pyav()
++        rate = self._stream.average_rate
++        self.native_fps = float(rate) if rate else 0.0
++      except Exception as e:
++        print(f"[camera] PyAV 打开失败({e!r})，回退 cv2 路径", flush=True)
++        self.use_pyav = False
++    if not self.use_pyav:
++      self.cap = cv.VideoCapture(camera_id)
++      # 先取源视频自身帧率（节流对表要用；set 之后再取可能被改）
++      self.native_fps = float(self.cap.get(cv.CAP_PROP_FPS) or 0.0)
+ 
+-    self.W = self.cap.get(cv.CAP_PROP_FRAME_WIDTH)
+-    self.H = self.cap.get(cv.CAP_PROP_FRAME_HEIGHT)
++      self.cap.set(cv.CAP_PROP_FRAME_WIDTH, 1280.0)
++      self.cap.set(cv.CAP_PROP_FRAME_HEIGHT, 720.0)
++      self.cap.set(cv.CAP_PROP_FPS, 25.0)
++
++    # [播放管线补丁] 统一按 target_size 输出
++    self.W, self.H = float(self.target_size[0]), float(self.target_size[1])
+ 
+   @classmethod
+   def bgr2nv12(self, bgr):
+     frame = av.VideoFrame.from_ndarray(bgr, format='bgr24')
+-    return frame.reformat(format='nv12').to_ndarray()
++    nv12 = frame.reformat(format='nv12').to_ndarray()
++    h, w = bgr.shape[:2]
++    # [离线视频移植补丁] 按 camerad 的 NV12 对齐布局填充（stride 对齐 128），
++    # 否则 modeld 按对齐尺寸读取会报 "buffer is smaller than requested size"
++    stride, y_height, uv_height, size = get_nv12_info(w, h)
++    if stride == w and y_height == h:
++      return nv12
++    out = np.zeros(size, dtype=np.uint8)
++    planes = out[:stride * (y_height + uv_height)].reshape(-1, stride)
++    planes[:h, :w] = nv12[:h]
++    planes[y_height:y_height + h // 2, :w] = nv12[h:]
++    return out
++
++  # [播放管线补丁 2026-09-27] 免转码：任意分辨率 → 目标尺寸（播放时实时对齐）。
++  # 与旧转码脚本的 scale=...:force_original_aspect_ratio=increase,crop=... 保持同样的
++  # 「放大铺满 + 居中裁切」逻辑：不拉伸画面（拉伸会让模型几何失真），只裁掉多余边缘。
++  @staticmethod
++  def fit_to_target(frame, target_size):
++    tw, th = target_size
++    h, w = frame.shape[:2]
++    if w == tw and h == th:
++      return frame
++    s = max(tw / w, th / h)
++    nw, nh = max(tw, int(round(w * s))), max(th, int(round(h * s)))
++    frame = cv.resize(frame, (nw, nh), interpolation=cv.INTER_LINEAR)
++    x0 = (nw - tw) // 2
++    y0 = (nh - th) // 2
++    return frame[y0:y0 + th, x0:x0 + tw]
++
++  # [播完标记 2026-09-28] 视频定格后相机仍按输出帧率重发最后一帧，frameId 会一直涨，
++  # 网页光看 frameId 分不清「在播」还是「已播完」→ 定格时写 ended.flag，重播/新开时清掉。
++  @staticmethod
++  def set_ended_flag(demo_dir, ended):
++    try:
++      p = os.path.join(demo_dir, "ended.flag")
++      if ended:
++        with open(p, "w") as f:
++          f.write("1")
++      elif os.path.exists(p):
++        os.remove(p)
++    except OSError:
++      pass
++
++  # ===== [降占用补丁 2026-09-28] PyAV 视频播放路径（默认；OP_CAM_BACKEND=cv2 回退旧路径）=====
++  def _open_pyav(self):
++    # [硬件解码 2026-09-28] 优先走 VideoToolbox 硬件解码：大分辨率源（如 2880x1800 录屏）软解要吃掉 1~2 个核，
++    # 硬解用专用媒体引擎，CPU 大幅下降，输出帧本身就是 NV12。OP_CAM_HWACCEL=0 可回退软件解码。
++    self._container = None
++    if os.getenv("OP_CAM_HWACCEL", "1") != "0":
++      try:
++        from av.codec.hwaccel import HWAccel
++        self._container = av.open(self.video_path, hwaccel=HWAccel("videotoolbox"))
++        print("[camera] 解码方式：VideoToolbox 硬件解码", flush=True)
++      except Exception as e:
++        print(f"[camera] 硬件解码不可用（{e!r}），回退软件解码", flush=True)
++        self._container = None
++    if self._container is None:
++      self._container = av.open(self.video_path)
++      print("[camera] 解码方式：软件解码", flush=True)
++    self._stream = self._container.streams.video[0]
++    self._stream.thread_type = "AUTO"   # 帧级多线程解码（与 cv2 后端一致）
++    self._iter = None
++
++  def _pyav_next(self):
++    """取下一个解码帧；到结尾返回 None"""
++    if self._iter is None:
++      self._iter = self._container.decode(self._stream)
++    try:
++      return next(self._iter)
++    except StopIteration:
++      return None
++    except Exception as e:
++      print(f"[camera] 解码结束/异常: {e!r}", flush=True)
++      return None
++
++  @staticmethod
++  def _flip_nv12(nv, w, h):
++    """NV12 画面 180° 旋转：Y 全翻转；UV 行序反转 + 行内按 2 字节一组反转"""
++    y = nv[:h][::-1, ::-1]
++    uv = nv[h:].reshape(-1, w)[::-1].reshape(-1, 2)[::-1].reshape(-1, w)
++    return np.concatenate([y.ravel(), uv.ravel()]).reshape(-1, w)
++
++  def _src_to_nv12(self, frame, flip=False):
++    """解码帧 → 对齐 NV12：放大铺满 + 居中裁切（与旧 fit_to_target 同逻辑）。
++    缩放/色彩转换/4:2:0 采样由 swscale 一趟完成，不再经 BGR 中转。"""
++    tw, th = self.target_size
++    w, h = frame.width, frame.height
++    if w == tw and h == th:
++      nw, nh = w, h
++      nv = frame.reformat(format='nv12').to_ndarray()
++    else:
++      s = max(tw / w, th / h)
++      nw, nh = max(tw, int(round(w * s))), max(th, int(round(h * s)))
++      # [NV12 偶数宽修复 2026-09-28] NV12 色度横向 2 倍下采样，宽度必须是偶数：
++      # 2880x1800 等比缩到 1933（奇数）时 swscale 产出的缓冲和 to_ndarray 的期望对不上
++      # → ValueError → 相机线程崩溃 → 界面全灰（用户 700MB 录屏就是这个坑）
++      nw += nw % 2
++      nv = frame.reformat(nw, nh, format='nv12').to_ndarray()
++    y0, x0 = (nh - th) // 2, (nw - tw) // 2
++    x0 -= x0 % 2                        # UV 平面 2 像素一组，横向裁切保持偶数
++    if x0 == 0 and y0 == 0:
++      nv2 = nv
++    else:
++      y = nv[y0:y0 + th, x0:x0 + tw]
++      uv = nv[nh:].reshape(-1, nw)[y0 // 2:(y0 + th) // 2, x0:x0 + tw]
++      nv2 = np.concatenate([y.ravel(), uv.ravel()]).reshape(-1, tw)
++    if flip:
++      nv2 = Camera._flip_nv12(nv2, tw, th)
++    # 按 camerad 的 NV12 对齐布局填充（stride 对齐 128），与旧 bgr2nv12 一致
++    stride, y_height, uv_height, size = get_nv12_info(tw, th)
++    if stride == tw and y_height == th:
++      return nv2
++    out = np.zeros(size, dtype=np.uint8)
++    planes = out[:stride * (y_height + uv_height)].reshape(-1, stride)
++    planes[:th, :tw] = nv2[:th]
++    planes[y_height:y_height + th // 2, :tw] = nv2[th:]
++    return out
++
++  @staticmethod
++  def _read_flags(demo_dir):
++    try:
++      with open(f"{demo_dir}/pause.flag") as f:
++        paused = f.read().strip() == "1"
++    except Exception:
++      paused = False
++    try:
++      with open(f"{demo_dir}/speed.flag") as f:
++        speed = float(f.read().strip() or "1")
++    except Exception:
++      speed = 1.0
++    speed = min(4.0, max(0.25, speed))
++    try:
++      with open(f"{demo_dir}/restart.flag") as f:
++        restart = f.read().strip()
++    except Exception:
++      restart = ""
++    return paused, speed, restart
++
++  def _read_frames_pyav(self):
++    """PyAV 播放循环：解码 → 一趟缩放+转色 → 对齐输出。
++    节流/暂停/倍速/重播/播完定格 与旧路径行为一致。"""
++    native_fps = self.native_fps
++    if not (1.0 < native_fps < 240.0):
++      native_fps = 20.0
++    out_fps = _target_fps() or float(os.getenv("VIDEO_OUT_FPS", "20"))   # [推理帧率设置 2026-09-29]
++    demo_dir = os.getenv("OP_PLAYBACK_DIR", "/Users/lu/op项目of all/openpilot/offline_demo")
++    print(f"[camera] PyAV 路径；flag 目录 = {demo_dir}（OP_PLAYBACK_DIR={os.getenv('OP_PLAYBACK_DIR')!r}）", flush=True)
++    flip = os.getenv("WEBCAM_FLIP", "0") == "1"
++
++    paused, speed, restart_seq = Camera._read_flags(demo_dir)
++    flags_t = time.monotonic()
++    # [按时间抽帧 2026-09-28] 分数抽帧：每消费 1 源帧累积 out_ratio 额度，攒满 1 才输出一帧。
++    # 原来用整数 step = round(fps/out_fps)：30fps 只能凑到 15 次/秒、24fps 会飙到 24 次/秒。
++    # 现在无论源视频多少帧，输出都稳定在 min(源帧率, VIDEO_OUT_FPS)：30 → 20、24 → 20、10 → 10。
++    out_ratio = out_fps / (native_fps * speed)
++    out_accum = 1.0                     # 先攒满 → 第一帧立刻输出
++    period = 1.0 / (native_fps * speed)
++    Camera.set_ended_flag(demo_dir, False)   # [播完标记 2026-09-28] 新开播 → 清掉上一轮的「已播完」
++    next_t = time.monotonic()
++    idx = 0
++    last_yuv = None
++    frozen_logged = False
++    # [诊断 2026-09-28] OP_CAM_DEBUG=1：每 2 秒打印耗时分布（解码/转色/生成器外部）
++    dbg = os.getenv("OP_CAM_DEBUG") == "1"
++    t_dec = t_conv = t_out = 0.0
++    n_out = 0
++    t_stat = time.monotonic()
++    t_iter = None
++    while True:
++      now = time.monotonic()
++      if dbg and t_iter is not None:
++        t_out += now - t_iter            # 生成器外部（camerad 的 vipc 发送等）
++      t_iter = now
++      if dbg and now - t_stat >= 2.0:
++        el = now - t_stat
++        print(f"[camera-dbg] 源帧={idx} 输出={n_out} 解码={t_dec:.2f}s 转色={t_conv:.2f}s 外发={t_out:.2f}s 窗口={el:.1f}s", flush=True)
++        t_dec = t_conv = t_out = 0.0
++        n_out = 0
++        t_stat = now
++      if now - flags_t >= 0.5:
++        flags_t = now
++        p2, s2, r2 = Camera._read_flags(demo_dir)
++        # [推理帧率设置 2026-09-29] 帧率文件改了 → 视频路径也热切换
++        _nf = _target_fps()
++        if _nf and abs(_nf - out_fps) > 0.01:
++          out_fps = _nf
++          out_ratio = out_fps / (native_fps * speed)
++          out_accum = 1.0
++          print(f"[camera] 推理帧率改为 {out_fps:g} fps", flush=True)
++        if dbg:
++          print(f"[camera-dbg] flags: paused={p2} speed={s2} restart={r2!r} (上次 seq={restart_seq!r})", flush=True)
++        if p2 != paused:
++          paused = p2
++          next_t = time.monotonic()          # 恢复播放时重设节流基准，避免补帧
++          print(f"[camera] 播放控制：{'暂停' if paused else '继续'}", flush=True)
++        if s2 != speed:
++          speed = s2
++          out_ratio = out_fps / (native_fps * speed)   # [按时间抽帧] 倍速变了 → 重算输出额度
++          out_accum = 1.0
++          period = 1.0 / (native_fps * speed)
++          next_t = time.monotonic()
++          print(f"[camera] 播放控制：倍速 {speed:g}x", flush=True)
++        if r2 != restart_seq:
++          restart_seq = r2
++          try:
++            self._open_pyav()
++            idx = 0
++            next_t = time.monotonic()
++            out_accum = 1.0                              # [按时间抽帧] 重播后第一帧立刻输出
++            Camera.set_ended_flag(demo_dir, False)       # [播完标记 2026-09-28] 重播 → 清掉「已播完」
++            frozen_logged = False
++            print("[camera] 播放控制：从头重播", flush=True)
++          except Exception as e:
++            print(f"[camera] 重播失败: {e!r}", flush=True)
++      if paused and last_yuv is not None:
++        time.sleep(1.0 / out_fps)
++        yield last_yuv
++        continue
++      # 跳到下一个输出帧：中间帧只解码（不缩放不转色），每 step 个源帧输出 1 帧
++      src = None
++      while True:
++        _td = time.monotonic()
++        src = self._pyav_next()
++        t_dec += time.monotonic() - _td
++        if src is None:
++          break
++        idx += 1
++        next_t += period
++        dt = next_t - time.monotonic()
++        if dt > 0:
++          time.sleep(dt)
++        else:
++          next_t = time.monotonic()
++        # [按时间抽帧 2026-09-28] 攒够一次输出额度才输出这帧；否则继续解码下一帧
++        out_accum += out_ratio
++        if out_accum >= 1.0:
++          out_accum = min(out_accum - 1.0, 1.0)
++          break
++      if src is None:
++        if last_yuv is not None:
++          # [A2 修复] 播完定格：保持最后一帧输出（不再回绕循环播放）
++          if not frozen_logged:
++            print("[camera] 视频播放完毕，定格最后一帧（不再循环）", flush=True)
++            Camera.set_ended_flag(demo_dir, True)   # [播完标记 2026-09-28] 网页据此显示「已播完」（frameId 还在涨，不能当 fps 看）
++            frozen_logged = True
++          time.sleep(1.0 / out_fps)
++          yield last_yuv
++          continue
++        break
++      _tc = time.monotonic()
++      try:
++        nv = self._src_to_nv12(src, flip)
++      except Exception as e:
++        # [转换保险丝 2026-09-28] 单帧转换失败只跳过这一帧，不再炸掉相机线程（否则整条流断掉 → 界面全灰）
++        print(f"[camera] 单帧转换失败，跳过这一帧: {e!r}", flush=True)
++        continue
++      last_yuv = nv.tobytes()
++      t_conv += time.monotonic() - _tc
++      n_out += 1
++      yield last_yuv
++    try:
++      self._container.close()
++    except Exception:
++      pass
++
++  # [静止帧去重 2026-09-29] 画面内容没变 → 不再发布这一帧。
++  # 背景：视频播完定格 / 游戏暂停时，相机会反复重发同一帧（frameId 照涨），而模型是循环
++  # 网络——反复吃同一张图，内部状态会漂移到「固定点幻觉」：实测游戏暂停时吐出 0.97 概率的
++  # 幻影前车，且每次都是同一套错误车道线/曲率（用户报的「抽搐/跳出来 4 条线 + 一辆车」）。
++  # 这里按内容哈希去重（抽稀 1/64 采样，开销可忽略）：画面停住时模型不再空转 → 输出保持
++  # 在最后一帧真实结果上；画面恢复变化后自动继续。定格画面照旧定格（UI 保持最后一帧）。
++  def _scene_sig(self, buf):
++    # [闪动修复 v3 2026-09-29] 取「画面中下部」抽稀采样：Y（亮度）+ UV（色度）都要（否则
++    # 「颜色变、亮度没变」会漏判）。行 30%~75%：避开顶部速度大字（约 7~16%）和底部方向盘
++    # 图标/工具条（75% 以下）——这段是路面+路侧，行车时变化最大、又没有任何 HUD 干扰。
++    # 实测：真实行车帧 4.5~7.4% 显著变化；冻结帧 0%；8px 慢移 3.6% —— 分得很开。
++    try:
++      w, h = int(self.W), int(self.H)
++      stride, yh, uvh, _sz = get_nv12_info(w, h)
++      if len(buf) < stride * (yh + uvh):
++        return None
++      y = np.frombuffer(buf, dtype=np.uint8, count=stride * yh).reshape(yh, stride)
++      ys = y[int(yh * 0.30):int(yh * 0.75), int(w * 0.05):int(w * 0.95)][::4, ::4]
++      uv = np.frombuffer(buf, dtype=np.uint8, offset=stride * yh, count=stride * uvh).reshape(uvh, stride)
++      us = uv[int(uvh * 0.15):int(uvh * 0.375), int(w * 0.05):int(w * 0.95)][::4, ::4]
++      return np.concatenate([ys.ravel(), us.ravel()])
++    except Exception:
++      return None
+ 
+   def read_frames(self):
++    gen = self._read_frames_inner()
++    if not SKIP_STATIC_FRAMES:
++      yield from gen
++      return
++    last_sig, skipped = None, 0
++    # [连贯性门 2026-09-29] ref_sig/ref_t = 参考帧（上次放行时留的，约 1.5s 前）；held = 慢爬中被扣帧数
++    ref_sig, ref_t, held = None, 0.0, 0
++    for buf in gen:
++      if buf:
++        sig = self._scene_sig(buf)
++        if sig is None:
++          # 兜底：几何算不出来时退回字节级精确去重（老行为）
++          sig = hashlib.blake2b(buf[::64], digest_size=8).digest()
++          same = (sig == last_sig)
++        else:
++          same = isinstance(last_sig, np.ndarray) and _scene_same(sig, last_sig)
++        if same:
++          skipped += 1
++          if skipped == 1:
++            print("[camera] 画面几乎没变化（卡顿重复帧）→ 暂停发布（模型不再空转漂移；恢复变化后自动继续）", flush=True)
++          time.sleep(0.01)
++          continue
++        # [连贯性门 2026-09-29] 每 ~1.5s 拿当前帧和参考帧比一次：没真的动 → 扣下不喂模型（参考帧
++        # 不刷新，等累计变化攒够才放行一帧）；真的动了 → 放行并刷新参考帧。正常行车零影响。
++        if MOTION_GATE and isinstance(sig, np.ndarray):
++          _now = time.monotonic()
++          if ref_sig is None:
++            ref_sig, ref_t = sig, _now
++          elif _now - ref_t >= MOTION_WINDOW:
++            if not _scene_moved(sig, ref_sig):
++              held += 1
++              if held == 1:
++                print(f"[camera] 画面 {MOTION_WINDOW:.1f}s 内累计几乎没动（慢爬/冻结）→ 暂停喂模型（防漂移）", flush=True)
++              time.sleep(0.01)
++              continue
++            if held:
++              print(f"[camera] 真实运动恢复（扣下过 {held} 帧慢爬帧）", flush=True)
++              held = 0
++            ref_sig, ref_t = sig, _now
++        if skipped:
++          print(f"[camera] 画面恢复变化（跳过 {skipped} 帧重复帧）", flush=True)
++          skipped = 0
++        last_sig = sig
++      yield buf
++
++  def _read_frames_inner(self):
++    # [BeamNG 移植补丁] 实时帧源：等文件更新 → 解码 → 转 NV12
++    if self.is_jpeg_source:
++      last_mtime = 0.0
++      last_pub = 0.0
++      last_jpeg_hash = None
++      while True:
++        try:
++          mtime = os.path.getmtime(self.jpeg_path)
++        except OSError:
++          time.sleep(0.05)
++          continue
++        if mtime == last_mtime:
++          time.sleep(0.005)
++          continue
++        # [闪动修复 v2.1 2026-09-29] 一次读入内存 → 在内存里查 EOI(FFD9) → imdecode。
++        # 分开「查文件尾 + imread」有竞态（游戏窗口正好在重写 → cv2 会解出半张图）。
++        try:
++          with open(self.jpeg_path, "rb") as f:
++            data = f.read()
++        except OSError:
++          time.sleep(0.004)
++          continue
++        if not data.endswith(b"\xff\xd9"):
++          time.sleep(0.004)      # 还在写（半个 JPEG），下一轮重试
++          continue
++        # [闪动修复 v3 2026-09-29] 字节级预筛：文件内容与上一帧逐字节相同（游戏卡顿重写同一张图）
++        # → 直接跳过，连解码都不做（省 CPU），也绝不喂给模型。
++        h = hashlib.blake2b(data, digest_size=8).digest()
++        if h == last_jpeg_hash:
++          last_mtime = mtime
++          time.sleep(0.003)
++          continue
++        last_jpeg_hash = h
++        # [推理帧率设置 2026-09-29] 输出节流到目标推理帧率（文件改了立即生效）
++        fps = _target_fps()
++        now = time.monotonic()
++        if fps and (now - last_pub) < (1.0 / fps) - 0.002:
++          last_mtime = mtime          # 这帧主动放弃，等下一帧（不重试同一帧）
++          time.sleep(0.003)
++          continue
++        last_mtime = mtime
++        last_pub = now
++        frame = cv.imdecode(np.frombuffer(data, dtype=np.uint8), cv.IMREAD_COLOR)
++        if frame is None:
++          # ffmpeg 正在写这个文件，拿到的是半个 JPEG，下一轮再试
++          time.sleep(0.01)
++          continue
++        # [播放管线补丁] 任意尺寸 → target_size（road=1928x1208 / cabin=1344x760）
++        frame = Camera.fit_to_target(frame, self.target_size)
++        yuv = Camera.bgr2nv12(frame)
++        yield yuv.data.tobytes()
++      return
++
++    # [降占用补丁 2026-09-28] 视频文件走 PyAV 快路径（默认；OP_CAM_BACKEND=cv2 回退下面的旧路径）
++    if self.use_pyav:
++      yield from self._read_frames_pyav()
++      return
++
++    flip = os.getenv("WEBCAM_FLIP", "0" if self.is_video_file else "1") == "1"
++    # [播放管线补丁 2026-09-27] 按视频自身帧率节流，修复「视频 2 倍速播放」：
++    # 旧代码没有任何等待——解码多快就播多快（M1 解码 1928x1208 约 40fps，而视频 20fps → 正好 2 倍速）。
++    # 现在每读一帧按 1/native_fps 对表；输出上限 VIDEO_OUT_FPS（默认 20 = 模型训练帧率），
++    # 多出来的帧只解码不输出（60fps 源 → 每 3 帧输出 1 帧 → 1 倍速 + 20fps 输出）。
++    native_fps = getattr(self, "native_fps", 0.0)
++    if not (1.0 < native_fps < 240.0):
++      native_fps = 20.0
++    out_fps = _target_fps() or float(os.getenv("VIDEO_OUT_FPS", "20"))   # [推理帧率设置 2026-09-29]
++    # [C1 补丁 2026-09-27] 播放控制（暂停/倍速/重播）：控制台后端写 flag 文件，这里每 0.5 秒读一次。
++    #   pause.flag  = "1" 暂停（保持当前帧，不推进）
++    #   speed.flag  = 播放倍速（0.5 / 1 / 2，默认 1）
++    #   restart.flag 值变化 = 从头重播
++    demo_dir = os.getenv("OP_PLAYBACK_DIR", "/Users/lu/op项目of all/openpilot/offline_demo")
++
++    def _read_flags():
++      try:
++        with open(f"{demo_dir}/pause.flag") as f:
++          paused = f.read().strip() == "1"
++      except Exception:
++        paused = False
++      try:
++        with open(f"{demo_dir}/speed.flag") as f:
++          speed = float(f.read().strip() or "1")
++      except Exception:
++        speed = 1.0
++      speed = min(4.0, max(0.25, speed))
++      try:
++        with open(f"{demo_dir}/restart.flag") as f:
++          restart = f.read().strip()
++      except Exception:
++        restart = ""
++      return paused, speed, restart
++
++    paused, speed, restart_seq = _read_flags()
++    flags_t = time.monotonic()
++    # [按时间抽帧 2026-09-28] 分数抽帧（与 PyAV 路径一致）：源视频输出稳定在 min(源帧率, VIDEO_OUT_FPS)；
++    # 非视频源（真实/实时帧）保持每帧输出不变。
++    out_ratio = out_fps / (native_fps * speed) if self.is_video_file else 1.0
++    out_accum = 1.0
++    period = 1.0 / (native_fps * speed)
++    Camera.set_ended_flag(demo_dir, False)   # [播完标记 2026-09-28] 新开播 → 清掉上一轮的「已播完」
++    pace = self.is_video_file
++    next_t = time.monotonic()
++    idx = 0
++    last_yuv = None
++    frozen_logged = False
+     while True:
+-      ret, frame = self.cap.read()
+-      if not ret:
++      now = time.monotonic()
++      if now - flags_t >= 0.5:
++        flags_t = now
++        p2, s2, r2 = _read_flags()
++        if p2 != paused:
++          paused = p2
++          next_t = time.monotonic()          # 恢复播放时重设节流基准，避免补帧
++          print(f"[camera] 播放控制：{'暂停' if paused else '继续'}", flush=True)
++        if s2 != speed:
++          speed = s2
++          out_ratio = out_fps / (native_fps * speed) if self.is_video_file else 1.0   # [按时间抽帧] 倍速变了
++          out_accum = 1.0
++          period = 1.0 / (native_fps * speed)
++          next_t = time.monotonic()
++          print(f"[camera] 播放控制：倍速 {speed:g}x", flush=True)
++        if r2 != restart_seq:
++          restart_seq = r2
++          try:
++            self.cap.set(cv.CAP_PROP_POS_FRAMES, 0)
++            idx = 0
++            next_t = time.monotonic()
++            out_accum = 1.0                              # [按时间抽帧] 重播后第一帧立刻输出
++            Camera.set_ended_flag(demo_dir, False)       # [播完标记 2026-09-28] 重播 → 清掉「已播完」
++            frozen_logged = False
++            print("[camera] 播放控制：从头重播", flush=True)
++          except Exception:
++            pass
++      if paused and last_yuv is not None:
++        time.sleep(1.0 / out_fps)
++        yield last_yuv
++        continue
++      # [倍速优化 2026-09-27] 跳过中间帧时用 grab() 只推进不解码（省 CPU，倍速才接近真实倍率）
++      # [按时间抽帧 2026-09-28] 输出规则改为分数抽帧：每消费 1 源帧攒 out_ratio 额度，攒满 1 才输出
++      eof = False
++      while True:
++        out_accum += out_ratio
++        if out_accum >= 1.0:
++          out_accum = min(out_accum - 1.0, 1.0)
++          break
++        if not self.cap.grab():
++          eof = True
++          break
++        idx += 1
++        if pace:
++          next_t += period
++          dt = next_t - time.monotonic()
++          if dt > 0:
++            time.sleep(dt)
++          else:
++            next_t = time.monotonic()
++      ret = False
++      if not eof:
++        ret, frame = self.cap.read()
++        if pace:
++          next_t += period
++          dt = next_t - time.monotonic()
++          if dt > 0:
++            time.sleep(dt)
++          else:
++            next_t = time.monotonic()
++        idx += 1
++      if eof or not ret:
++        if self.is_video_file and last_yuv is not None:
++          # [A2 修复 2026-09-27] 播完定格：保持最后一帧输出（不再回绕循环播放——用户要求「一遍就够了」）
++          if not frozen_logged:
++            print("[camera] 视频播放完毕，定格最后一帧（不再循环）", flush=True)
++            Camera.set_ended_flag(demo_dir, True)   # [播完标记 2026-09-28] 网页据此显示「已播完」（frameId 还在涨，不能当 fps 看）
++            frozen_logged = True
++          time.sleep(1.0 / out_fps)
++          yield last_yuv
++          continue
+         break
+-      # Rotate the frame 180 degrees (flip both axes)
+-      frame = cv.flip(frame, -1)
++      if flip:
++        # Rotate the frame 180 degrees (flip both axes)
++        frame = cv.flip(frame, -1)
++      # [播放管线补丁] 任意分辨率 → 目标尺寸（免转码实时对齐）
++      frame = Camera.fit_to_target(frame, self.target_size)
+       yuv = Camera.bgr2nv12(frame)
+-      yield yuv.data.tobytes()
++      last_yuv = yuv.data.tobytes()
++      yield last_yuv
+     self.cap.release()
+diff --git a/openpilot/system/camerad/webcam/camerad.py b/openpilot/system/camerad/webcam/camerad.py
+index 4dfa5f3..2aeb379 100755
+--- a/openpilot/system/camerad/webcam/camerad.py
++++ b/openpilot/system/camerad/webcam/camerad.py
+@@ -2,6 +2,7 @@
+ import threading
+ import os
+ import platform
++import time
+ from collections import namedtuple
+ 
+ from openpilot.cereal.visionipc import VisionStreamType
+@@ -9,7 +10,7 @@ from msgq.visionipc import VisionIpcServer
+ from openpilot.cereal import messaging
+ 
+ from openpilot.system.camerad.webcam.camera import Camera
+-from openpilot.common.realtime import Ratekeeper
++from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
+ 
+ NARROW_ROAD_CAM = os.getenv("NARROW_ROAD_CAM", os.getenv("ROAD_CAM", "0"))
+ WIDE_CAM = os.getenv("WIDE_CAM")
+@@ -27,7 +28,10 @@ if DRIVER_CAM:
+ 
+ class Camerad:
+   def __init__(self):
+-    self.pm = messaging.PubMaster([c.msg_name for c in CAMERAS])
++    # [离线视频移植补丁] 额外发布 wideRoadCameraState 消息：无独立广角相机，
++    # 但 selfdrived 的 all_alive 要求它存在（否则 commIssue → 无法接管）。
++    # 不创建 WIDE_ROAD 的 VIPC 流，避免 modeld 进入双相机(use_extra_client)模式。
++    self.pm = messaging.PubMaster([c.msg_name for c in CAMERAS] + ["wideRoadCameraState"])
+     self.vipc_server = VisionIpcServer("camerad")
+ 
+     self.cameras = []
+@@ -35,12 +39,18 @@ class Camerad:
+       cam_device = f"/dev/video{c.cam_id}" if platform.system() != "Darwin" else c.cam_id
+       cam = Camera(c.msg_name, c.stream_type, cam_device)
+       self.cameras.append(cam)
+-      self.vipc_server.create_buffers(c.stream_type, 20, cam.W, cam.H)
++      # [离线视频移植补丁] 用对齐后的 NV12 尺寸创建 VIPC buffer（与 camerad / tools/sim 一致）
++      w, h = int(cam.W), int(cam.H)
++      stride, y_height, _, size = get_nv12_info(w, h)
++      self.vipc_server.create_buffers_with_sizes(c.stream_type, 20, w, h, size, stride, stride * y_height)
+ 
+     self.vipc_server.start_listener()
+ 
+   def _send_yuv(self, yuv, frame_id, pub_type, yuv_type):
+-    eof = int(frame_id * 0.05 * 1e9)
++    # [离线视频移植补丁] 必须用真实单调时钟：locationd 会校验 cameraOdometry 的
++    # timestampEof 与滤波器时间差（MAX_FILTER_REWIND_TIME=0.8s），用视频相对时间
++    # (frame_id*0.05s) 会导致时钟域不一致 → locationdTemporaryError → 无法接管。
++    eof = int(time.monotonic() * 1e9)
+     self.vipc_server.send(yuv_type, yuv, frame_id, eof, eof)
+     dat = messaging.new_message(pub_type, valid=True)
+     msg = {
+@@ -51,13 +61,21 @@ class Camerad:
+     }
+     setattr(dat, pub_type, msg)
+     self.pm.send(pub_type, dat)
++    # 同一帧同步发布一份 wideRoadCameraState（仅消息，无 VIPC 流）
++    if pub_type == "narrowRoadCameraState":
++      wdat = messaging.new_message("wideRoadCameraState", valid=True)
++      setattr(wdat, "wideRoadCameraState", msg)
++      self.pm.send("wideRoadCameraState", wdat)
+ 
+   def camera_runner(self, cam):
+-    rk = Ratekeeper(20, None)
++    # [免转码播放补丁 2026-09-27] 去掉 Ratekeeper(20)：
++    # 相机自身已按视频原生帧率节流（见 camera.py），多余帧在源头按 step 丢弃（60fps→20fps）。
++    # 若这里再 keep_time() 睡到 50ms 周期，会与相机节流叠加成「慢动作」：
++    # 24fps 源 → 0.79 倍速、60fps 源 → 0.32 倍速。现在输出节奏完全由视频时钟决定，
++    # 消费端（modeld/UI）各按自己的频率读最新帧 —— 效果等价于旧转码 -r 20，但免转码。
+     for yuv in cam.read_frames():
+       self._send_yuv(yuv, cam.cur_frame_id, cam.cam_type_state, cam.stream_type)
+       cam.cur_frame_id += 1
+-      rk.keep_time()
+ 
+   def run(self):
+     threads = []
+diff --git a/openpilot/system/manager/process_config.py b/openpilot/system/manager/process_config.py
+index b8a1e4a..dd26610 100644
+--- a/openpilot/system/manager/process_config.py
++++ b/openpilot/system/manager/process_config.py
+@@ -83,7 +83,9 @@ procs = [
+   PythonProcess("timed", "openpilot.system.timed", always_run, enabled=not PC),
+ 
+   PythonProcess("modeld", "openpilot.selfdrive.modeld.modeld", only_onroad),
+-  PythonProcess("dmonitoringmodeld", "openpilot.selfdrive.modeld.dmonitoringmodeld", driverview, enabled=(WEBCAM or not PC)),
++  # [macOS 移植] 驾驶员监测已按要求移除（2026-09-27）：Mac 摄像头的取景/画质无法支撑
++  # op 原版 DM 模型（轻微移动就丢人脸），保留代码但不再启动，避免白占 ~15% CPU。
++  PythonProcess("dmonitoringmodeld", "openpilot.selfdrive.modeld.dmonitoringmodeld", driverview, enabled=False),
+ 
+   PythonProcess("sensord", "openpilot.system.sensord.sensord", only_onroad, enabled=not PC),
+   PythonProcess("ui", "openpilot.selfdrive.ui.ui", always_run),
+@@ -97,7 +99,8 @@ procs = [
+   PythonProcess("selfdrived", "openpilot.selfdrive.selfdrived.selfdrived", only_onroad),
+   PythonProcess("card", "openpilot.selfdrive.car.card", only_onroad),
+   PythonProcess("deleter", "openpilot.system.loggerd.deleter", always_run),
+-  PythonProcess("dmonitoringd", "openpilot.selfdrive.monitoring.dmonitoringd", driverview, enabled=(WEBCAM or not PC)),
++  # [macOS 移植] 同 dmonitoringmodeld：驾驶员监测已移除，不再启动（改由模拟传感器填状态）
++  PythonProcess("dmonitoringd", "openpilot.selfdrive.monitoring.dmonitoringd", driverview, enabled=False),
+   PythonProcess("qcomgpsd", "openpilot.system.qcomgpsd.qcomgpsd", qcomgps, enabled=COMMA_HARDWARE),
+   PythonProcess("pandad", "openpilot.selfdrive.pandad.pandad", always_run),
+   PythonProcess("paramsd", "openpilot.selfdrive.locationd.paramsd", only_onroad),
+diff --git a/openpilot/system/ui/lib/application.py b/openpilot/system/ui/lib/application.py
+index 230ddc6..e5519f2 100644
+--- a/openpilot/system/ui/lib/application.py
++++ b/openpilot/system/ui/lib/application.py
+@@ -1,5 +1,6 @@
+ import atexit
+ import cffi
++import json
+ import math
+ import os
+ import queue
+@@ -44,7 +45,17 @@ RECORD_OUTPUT = str(Path(os.getenv("RECORD_OUTPUT", "output")).with_suffix(".mp4
+ RECORD_QUALITY = int(os.getenv("RECORD_QUALITY", "23"))  # Dynamic bitrate quality level (CRF); 0 is lossless (bigger size), max is 51, default is 23 for x264
+ RECORD_BITRATE = os.getenv("RECORD_BITRATE", "")  # Target bitrate e.g. "2000k" (overrides RECORD_QUALITY when set)
+ RECORD_SPEED = int(os.getenv("RECORD_SPEED", "1"))  # Speed multiplier
++# [离线视频移植补丁] op 原生 UI 画面帧流：按 JPEG 落盘，供控制台网页内嵌显示
++OP_STREAM_PATH = os.getenv("OP_STREAM_PATH", "")              # 目标 JPEG 路径，空 = 关闭
++OP_STREAM_FPS = float(os.getenv("OP_STREAM_FPS", "8"))        # 出帧帧率
++OP_STREAM_W = int(os.getenv("OP_STREAM_W", "1024"))
++OP_STREAM_H = int(os.getenv("OP_STREAM_H", "512"))
++OP_STREAM_HIDDEN = os.getenv("OP_STREAM_HIDDEN", "1") == "1"  # 隐藏原生窗口（只在网页里看）
+ OFFSCREEN = os.getenv("OFFSCREEN") == "1"  # Disable FPS limiting for fast offline rendering
++# [C2 补丁 2026-09-27] 网页点击转发：控制台网页把点击坐标写进这个 JSON 文件（归一化 0~1），
++# UI 进程每帧读一次并合成 MouseEvent 注入 —— 在网页里点 op 画面 = 点真实 op 屏幕
++# （例如右上角的 experimental 按钮；设置页的各种按钮同理）。
++OP_CLICK_FILE = os.getenv("OP_CLICK_FILE", "")
+ 
+ GL_VERSION = """
+ #version 300 es
+@@ -155,8 +166,10 @@ class MouseEvent(NamedTuple):
+ 
+ 
+ class MouseState:
+-  def __init__(self, scale: float = 1.0):
++  def __init__(self, scale: float = 1.0, logical_width: float = 2160.0, logical_height: float = 1080.0):
+     self._scale = scale
++    self._logical_w = logical_width
++    self._logical_h = logical_height
+     self._events: deque[MouseEvent] = deque(maxlen=MOUSE_THREAD_RATE)  # bound event list
+     self._prev_mouse_event: list[MouseEvent | None] = [None] * MAX_TOUCH_SLOTS
+ 
+@@ -165,6 +178,41 @@ class MouseState:
+     self._exit_event = threading.Event()
+     self._thread = None
+ 
++    # [C2 补丁 2026-09-27] 网页点击转发状态
++    self._remote_seq = None
++    self._remote_release: MousePos | None = None
++
++  def _poll_remote_click(self):
++    """[C2 补丁] 读网页点击文件；有新的点击就合成「按下」事件（下一帧补「抬起」）。"""
++    if not OP_CLICK_FILE:
++      return
++    try:
++      with open(OP_CLICK_FILE) as f:
++        j = json.load(f)
++    except Exception:
++      return
++    seq = j.get("seq")
++    if self._remote_seq is None:
++      # 首次只记录不触发：避免上次会话遗留的旧点击在 UI 启动瞬间补一枪
++      self._remote_seq = seq
++      return
++    if seq is None or seq == self._remote_seq:
++      return
++    self._remote_seq = seq
++    x = max(0.0, min(1.0, float(j.get("x", 0.5)))) * self._logical_w
++    y = max(0.0, min(1.0, float(j.get("y", 0.5)))) * self._logical_h
++    with self._lock:
++      self._events.append(MouseEvent(MousePos(x, y), 0, True, False, True, time.monotonic()))
++    self._remote_release = MousePos(x, y)
++
++  def _flush_remote_release(self):
++    """[C2 补丁] 下一帧补一个「抬起」事件，凑成一次完整点击（与真手指一致）。"""
++    if self._remote_release is None:
++      return
++    p, self._remote_release = self._remote_release, None
++    with self._lock:
++      self._events.append(MouseEvent(p, 0, False, True, False, time.monotonic()))
++
+   def get_events(self) -> list[MouseEvent]:
+     with self._lock:
+       events = list(self._events)
+@@ -189,6 +237,8 @@ class MouseState:
+       self._rk.keep_time()
+ 
+   def _handle_mouse_event(self):
++    # [C2 补丁 2026-09-27] 先处理网页点击（合成按下），最后补上一帧点击的抬起事件
++    self._poll_remote_click()
+     # TODO: read touch events from evdev directly to get real kernel timestamps.
+     #  Polling at 140Hz with time.monotonic() causes timing jitter that makes scroll
+     #  velocity oscillate (alternating high/low). Real timestamps would also let us
+@@ -211,6 +261,7 @@ class MouseState:
+         with self._lock:
+           self._events.append(ev)
+         self._prev_mouse_event[slot] = ev
++    self._flush_remote_release()
+ 
+ 
+ class GuiApplication:
+@@ -248,7 +299,7 @@ class GuiApplication:
+     self._nav_stack_ticks: list[Callable[[], None]] = []
+     self._nav_stack_widgets_to_render = 1 if self.big_ui() else 2
+ 
+-    self._mouse = MouseState(self._scale)
++    self._mouse = MouseState(self._scale, self._width, self._height)
+     self._mouse_events: list[MouseEvent] = []
+     self._last_mouse_event: MouseEvent = MouseEvent(MousePos(0, 0), 0, False, False, False, 0.0)
+ 
+@@ -295,11 +346,14 @@ class GuiApplication:
+       flags = rl.ConfigFlags.FLAG_MSAA_4X_HINT
+       if ENABLE_VSYNC:
+         flags |= rl.ConfigFlags.FLAG_VSYNC_HINT
++      # [离线视频移植补丁] 画面只流给控制台网页时，隐藏原生窗口
++      if OP_STREAM_PATH and OP_STREAM_HIDDEN:
++        flags |= rl.ConfigFlags.FLAG_WINDOW_HIDDEN
+       rl.set_config_flags(flags)
+ 
+       rl.init_window(self._scaled_width, self._scaled_height, title)
+ 
+-      needs_render_texture = self._scale != 1.0 or BURN_IN_MODE or RECORD
++      needs_render_texture = self._scale != 1.0 or BURN_IN_MODE or RECORD or bool(OP_STREAM_PATH)
+       if self._scale != 1.0:
+         rl.set_mouse_scale(1 / self._scale, 1 / self._scale)
+       if needs_render_texture:
+@@ -337,11 +391,21 @@ class GuiApplication:
+         self._ffmpeg_thread = threading.Thread(target=self._ffmpeg_writer_thread, daemon=True)
+         self._ffmpeg_thread.start()
+ 
++      # [离线视频移植补丁] 启动 UI 画面帧流线程
++      if OP_STREAM_PATH:
++        self._stream_queue = queue.Queue(maxsize=4)
++        self._stream_stop = threading.Event()
++        self._stream_step = max(1, int(round(fps / max(0.5, OP_STREAM_FPS))))
++        self._stream_thread = threading.Thread(target=self._stream_writer_thread, daemon=True)
++        self._stream_thread.start()
++
+       # four display runs slightly faster than 60 FPS, let it dictate rate so we don't drift and drop frames
+       vblank_control = HARDWARE.get_device_type() == 'mici'
+       rl.set_target_fps(0 if OFFSCREEN or vblank_control else fps)
+ 
+       self._target_fps = fps
++      # [降占用补丁 2026-09-28] 启动时打印实际帧率（确认 FPS 环境变量生效）
++      print(f"[ui] target_fps={fps} (env FPS={os.getenv('FPS')!r})", flush=True)
+       self._load_fonts()
+       self._patch_text_functions()
+       self._patch_scissor_mode()
+@@ -396,6 +460,30 @@ class GuiApplication:
+       except Exception:
+         break
+ 
++  def _stream_writer_thread(self):
++    """[离线视频移植补丁] 后台线程：把最新一帧编码成 JPEG 并原子落盘（积压时只保留最新帧）。"""
++    from PIL import Image as PILImage
++    tmp_path = OP_STREAM_PATH + ".tmp"
++    while not self._stream_stop.is_set():
++      try:
++        data = self._stream_queue.get(timeout=0.5)
++      except queue.Empty:
++        continue
++      if data is None:
++        break
++      while True:                       # 丢掉积压，只编码最新
++        try:
++          data = self._stream_queue.get_nowait()
++        except queue.Empty:
++          break
++      try:
++        img = PILImage.frombytes("RGBA", (OP_STREAM_W, OP_STREAM_H), data)
++        img = img.transpose(PILImage.FLIP_TOP_BOTTOM).convert("RGB")  # 渲染纹理上下翻转
++        img.save(tmp_path, "JPEG", quality=80)
++        os.replace(tmp_path, OP_STREAM_PATH)
++      except Exception:
++        pass
++
+   def push_widget(self, widget: object):
+     if widget in self._nav_stack:
+       cloudlog.warning("Widget already in stack, cannot push again!")
+@@ -687,6 +775,18 @@ class GuiApplication:
+           self._ffmpeg_queue.put(data)  # Async write via background thread
+           rl.unload_image(image)
+ 
++        # [离线视频移植补丁] 抓一帧 UI 画面 → 缩放 → 交后台线程编码 JPEG（供控制台网页显示）
++        if OP_STREAM_PATH and self._frame % self._stream_step == 0:
++          image = rl.load_image_from_texture(self._render_texture.texture)
++          if image.width != OP_STREAM_W or image.height != OP_STREAM_H:
++            rl.image_resize(image, OP_STREAM_W, OP_STREAM_H)
++          data = bytes(rl.ffi.buffer(image.data, image.width * image.height * 4))
++          rl.unload_image(image)
++          try:
++            self._stream_queue.put_nowait(data)
++          except queue.Full:
++            pass
++
+         self._monitor_fps()
+         self._frame += 1
+ 
+diff --git a/openpilot/tools/camerastream/README.md b/openpilot/tools/camerastream/README.md
+index 9671199..7f29361 100644
+--- a/openpilot/tools/camerastream/README.md
++++ b/openpilot/tools/camerastream/README.md
+@@ -35,11 +35,11 @@ Ctrl+C will stop all three processes.
+ ### On the PC
+ Decode the stream with `compressed_vipc.py`:
+ 
+-```cd ~/openpilot/tools/camerastream && ./compressed_vipc.py <ip>```
++```cd ~/op项目of all/openpilot/tools/camerastream && ./compressed_vipc.py <ip>```
+ 
+ To actually display the stream, run `watch3` in separate terminal:
+ 
+-```cd ~/openpilot/selfdrive/ui/ && ./watch3.py```
++```cd ~/op项目of all/openpilot/selfdrive/ui/ && ./watch3.py```
+ 
+ ## compressed_vipc.py usage
+ ```
+@@ -61,6 +61,6 @@ options:
+ 
+ ## Example:
+ ```
+-cd ~/openpilot/tools/camerastream && ./compressed_vipc.py comma-ffffffff --cams 0
+-cd ~/openpilot/selfdrive/ui/ && ./watch3.py
++cd ~/op项目of all/openpilot/tools/camerastream && ./compressed_vipc.py comma-ffffffff --cams 0
++cd ~/op项目of all/openpilot/selfdrive/ui/ && ./watch3.py
+ ```
+diff --git a/openpilot/tools/sim/lib/simulated_sensors.py b/openpilot/tools/sim/lib/simulated_sensors.py
+index 63935d3..5347ace 100644
+--- a/openpilot/tools/sim/lib/simulated_sensors.py
++++ b/openpilot/tools/sim/lib/simulated_sensors.py
+@@ -1,3 +1,4 @@
++import os
+ import time
+ 
+ from openpilot.cereal import log
+@@ -110,7 +111,12 @@ class SimulatedSensors:
+     self.send_gps_message(simulator_state)
+ 
+     if (now - self.last_dmon_update) > DT_DMON/2:
+-      self.send_fake_driver_monitoring()
++      # [离线视频移植补丁] 真 DM 在跑（DRIVER_CAM=Mac 前置摄像头 + dmonitoringmodeld/dmonitoringd）时
++      # 不要再发假 driverStateV2/driverMonitoringState：两个进程发同一个消息会让 msgq 抛
++      # MultiplePublishersError → 桥接崩溃 → 没有 carState → 无法接管。
++      # 驾驶员监测已移除（2026-09-27）：默认改为发模拟状态，让 op 栈有 driverMonitoringState 可用
++      if os.getenv("REAL_DRIVER_MONITORING", "0") != "1":
++        self.send_fake_driver_monitoring()
+       self.last_dmon_update = now
+ 
+     if (now - self.last_perp_update) > 0.25:
+diff --git a/panda b/panda
+index 92eb565..5664a0e 160000
+--- a/panda
++++ b/panda
+@@ -1 +1 @@
+-Subproject commit 92eb565169fd553f4dfaf508c1a3f8dbc14fbfbf
++Subproject commit 5664a0e153375dc8085ae3714a11e67d87407707-dirty
+diff --git a/rednose_repo b/rednose_repo
+index 8671c17..9630580 160000
+--- a/rednose_repo
++++ b/rednose_repo
+@@ -1 +1 @@
+-Subproject commit 8671c17c3a4cdc4be5df07a068039e2da5b94eaa
++Subproject commit 9630580a2851e9d468a74a038779199d95b0dd4b-dirty
+diff --git a/teleoprtc_repo b/teleoprtc_repo
+index 1aa8fc4..accd687 160000
+--- a/teleoprtc_repo
++++ b/teleoprtc_repo
+@@ -1 +1 @@
+-Subproject commit 1aa8fc433bef1519a95c0700c96258c3be6dfb34
++Subproject commit accd6871bec745b10a95ad4d3c8feac2040f4090-dirty
+diff --git a/tinygrad_repo b/tinygrad_repo
+index 9d0446a..4b960a6 160000
+--- a/tinygrad_repo
++++ b/tinygrad_repo
+@@ -1 +1 @@
+-Subproject commit 9d0446a4ba8a532c8b674fb6ad795af015cd9dcf
++Subproject commit 4b960a62e241ea207695aa8b1d3a40f3609a997a-dirty
